@@ -375,7 +375,7 @@ install_hermes() {
     echo ""
     echo "  Plugin:    ~/.hermes/plugins/token-optimizer/ (auto-loaded by Hermes)"
     echo "  Verify:    python3 ${measure_py} hermes-doctor"
-    echo "  In Hermes: /token-optimizer  -  hermes token-optimizer (dashboard :24844)"
+    echo "  In Hermes: /token-optimizer  -  hermes token-optimizer (dashboard :24846)"
     echo "  Re-run this command after a git pull to update."
     echo ""
     exit 0

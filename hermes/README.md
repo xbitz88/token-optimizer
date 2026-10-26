@@ -91,7 +91,7 @@ Everything above runs on its own once the plugin is installed and allow-listed.
 | `/token-optimizer cost [words]` | What a past session cost, e.g. `/token-optimizer cost yesterday parser`. |
 | `/token-optimizer checkpoint` | Save a checkpoint of this session now. |
 | `/token-optimizer expand <id>` | Print a saved tool result in full. |
-| `hermes token-optimizer` | Opens the dashboard at `http://localhost:24844`. `--port <n>` to change it. |
+| `hermes token-optimizer` | Opens the dashboard at `http://localhost:24846`. `--port <n>` to change it. |
 
 Saved output can also be read with the command printed under it, for example:
 

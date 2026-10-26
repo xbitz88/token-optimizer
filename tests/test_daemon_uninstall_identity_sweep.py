@@ -200,8 +200,11 @@ def test_nothing_to_remove_honesty_preserved(tmp_path, monkeypatch, capsys):
 def test_ports_to_reclaim_scope():
     """Sweep-all must reclaim EVERY runtime's port, not just the
     resolved runtime's, or a sibling daemon + live CSRF token survives."""
+    # NOTE (wizardinglab fork): the Hermes slot moved from upstream's 24844
+    # to 24846, so the swept set drops 24844; 24846 now covers both hermes
+    # and cursor.
     all_ports = set(measure._daemon_ports_to_reclaim(this_install_only=False))
-    assert all_ports == {24842, 24843, 24844, 24845, 24846, 24847, 24848}
+    assert all_ports == {24842, 24843, 24845, 24846, 24847, 24848}
     scoped = measure._daemon_ports_to_reclaim(this_install_only=True)
     assert scoped == (measure.DAEMON_PORT,)
 
@@ -217,7 +220,7 @@ def test_sweep_all_reclaims_every_runtime_port(tmp_path, monkeypatch):
         lambda port=measure.DAEMON_PORT, **k: reclaimed.append(port),
     )
     measure._uninstall_launchd_daemon(this_install_only=False)
-    assert set(reclaimed) == {24842, 24843, 24844, 24845, 24846, 24847, 24848}
+    assert set(reclaimed) == {24842, 24843, 24845, 24846, 24847, 24848}
 
 
 def test_this_install_only_reclaims_resolved_port_only(tmp_path, monkeypatch):
@@ -243,7 +246,7 @@ def test_reclaim_of_one_port_never_aborts_the_others(tmp_path, monkeypatch):
 
     monkeypatch.setattr(measure, "_reclaim_posix_daemon_port", flaky)
     measure._uninstall_launchd_daemon(this_install_only=False)
-    assert set(seen) == {24842, 24843, 24844, 24845, 24846, 24847, 24848}
+    assert set(seen) == {24842, 24843, 24845, 24846, 24847, 24848}
 
 
 if __name__ == "__main__":
