@@ -24,7 +24,9 @@ _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 # Constants
 # ---------------------------------------------------------------------------
 
-DASHBOARD_PORT = 24844
+# NOTE (wizardinglab fork): upstream ships 24844; this fork uses 24846 so the
+# Hermes dashboard never collides with the Antigravity daemon on 24847.
+DASHBOARD_PORT = 24846
 _PLUGIN_NAME = "token-optimizer"
 
 # The plugin's __init__.py imports these three from its own directory, so
@@ -90,6 +92,7 @@ _COPIED_RUNTIME_MODULES = (
     "hermes_session.py",
     "runtime_env.py",
     "spawn_utils.py",
+    "auto_heal.py",
 )
 
 # Loads the INSTALLED plugin in a child process with a stand-in Hermes context
@@ -628,7 +631,7 @@ def _state_db_checks() -> list[dict[str, str]]:
 
 
 def _dashboard_port_check() -> dict[str, str]:
-    """Check whether dashboard port 24844 is available (not already in use)."""
+    """Check whether dashboard port 24846 is available (not already in use)."""
     port = DASHBOARD_PORT
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:

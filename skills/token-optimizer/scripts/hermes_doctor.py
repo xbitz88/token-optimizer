@@ -92,6 +92,7 @@ _COPIED_RUNTIME_MODULES = (
     "hermes_session.py",
     "runtime_env.py",
     "spawn_utils.py",
+    "auto_heal.py",
 )
 
 # Loads the INSTALLED plugin in a child process with a stand-in Hermes context

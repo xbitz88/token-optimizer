@@ -177,6 +177,7 @@ def _plugin_checks() -> list:
             )
         )
         return checks
+    checks.append(_check("ok", "plugin directory", str(pdir)))
 
     hooks_path = pdir / "hooks.json"
     if not hooks_path.is_file():

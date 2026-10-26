@@ -345,7 +345,7 @@ _FOREIGN_RUNTIMES = frozenset({"opencode", "copilot", "hermes", "cursor", "antig
 # (hermes/__init__.py:419 -> hermes_hook_bridge.py:222) shells to
 # ``python3 measure.py dashboard`` with TOKEN_OPTIMIZER_RUNTIME=hermes as the
 # ``hermes token-optimizer`` CLI command. The dashboard is hermes-aware — its
-# daemon identity is runtime-suffixed (port 24844, label
+# daemon identity is runtime-suffixed (port 24846, label
 # com.token-optimizer.hermes-dashboard; see _DAEMON_PORT_BY_RUNTIME), and
 # measure_components() routes to _measure_hermes_components() (no ~/.claude
 # scan), and _find_all_jsonl_files() returns [] under hermes (sessions come
@@ -376,7 +376,7 @@ _FOREIGN_RUNTIMES = frozenset({"opencode", "copilot", "hermes", "cursor", "antig
 _FOREIGN_RUNTIME_EXEMPTIONS: dict[str, frozenset[str]] = {
     "hermes": frozenset({"dashboard"}),
     "cursor": frozenset({"dashboard"}),
-    "antigravity": frozenset({"dashboard"}),
+    "antigravity": frozenset({"dashboard", "setup-daemon"}),
     "grok": frozenset({"dashboard"}),
 }
 
@@ -506,7 +506,7 @@ def _hermes_audit_notice() -> None:
     print("  measure.py hermes-rollup     — collect sessions into trends")
     print("  measure.py hermes-doctor     — readiness + hook capability probe")
     print("  measure.py hermes-install    — wire Token Optimizer into ~/.hermes/plugins/")
-    print("  measure.py dashboard         — open the Hermes dashboard (port 24844)")
+    print("  measure.py dashboard         — open the Hermes dashboard (port 24846)")
     print()
     print("To force this skill onto a specific runtime, set TOKEN_OPTIMIZER_RUNTIME.")
 
@@ -7533,8 +7533,8 @@ def _collect_hermes_hook_status_for_dashboard():
         },
         "hermes_dashboard_port": {
             "installed": _ok(f"Dashboard port {hermes_doctor.DASHBOARD_PORT}"),
-            "label": "Dashboard Port 24844",
-            "description": "Confirms that port 24844 is available or already serving the Hermes Token Optimizer dashboard.",
+            "label": "Dashboard Port 24846",
+            "description": "Confirms that port 24846 is available or already serving the Hermes Token Optimizer dashboard.",
             "install_cmd": f"{_runtime_cli('hermes')} open-dashboard",
             "uninstall_cmd": "",
         },
@@ -11296,8 +11296,9 @@ def generate_coach_data(focus=None, components=None, trends=None, include_determ
 
         # 2. Session duration creep
         if recent_sessions and older_sessions:
-            recent_durs = [s.get("duration_minutes", 0) for s in recent_sessions if s.get("duration_minutes")]
-            older_durs = [s.get("duration_minutes", 0) for s in older_sessions if s.get("duration_minutes")]
+            # Cap session duration at 1440 min (24h) to avoid idle multi-day outliers distorting averages
+            recent_durs = [min(1440.0, s.get("duration_minutes", 0)) for s in recent_sessions if s.get("duration_minutes")]
+            older_durs = [min(1440.0, s.get("duration_minutes", 0)) for s in older_sessions if s.get("duration_minutes")]
             if recent_durs and older_durs:
                 recent_avg_dur = sum(recent_durs) / len(recent_durs)
                 older_avg_dur = sum(older_durs) / len(older_durs)
@@ -11322,28 +11323,29 @@ def generate_coach_data(focus=None, components=None, trends=None, include_determ
                             "savings": "Not estimated: duration is not a token measure; compacting earlier reduces context fill",
                         })
                         score -= 5
-                    else:
-                        patterns_bad.append({
-                            "name": "Session Duration Creep",
-                            "severity": "low",
-                            "detail": f"Elapsed sessions averaging {recent_avg_dur:.0f} min (was {older_avg_dur:.0f} min); may include idle time and does not by itself indicate token waste",
-                            "fix": "If sessions are genuinely busier (not just idle), compact proactively around the midpoint",
-                            "savings": "Not estimated: elapsed session duration includes idle time and does not measure token waste",
-                        })
 
         # 3. Cache hit rate degradation (model-switch aware)
         multi_model_recent = sum(1 for s in recent_sessions if s.get("model_count", 1) > 1)
         multi_model_pct = (multi_model_recent / len(recent_sessions) * 100) if recent_sessions else 0
         history["multi_model_session_pct"] = round(multi_model_pct, 1)
         if recent_sessions and older_sessions:
-            recent_chr = [s.get("cache_hit_rate", 0) for s in recent_sessions if s.get("cache_hit_rate") is not None]
-            older_chr = [s.get("cache_hit_rate", 0) for s in older_sessions if s.get("cache_hit_rate") is not None]
-            if recent_chr and older_chr:
-                recent_avg_chr = sum(recent_chr) / len(recent_chr)
-                older_avg_chr = sum(older_chr) / len(older_chr)
-                history["cache_hit_recent_avg"] = round(recent_avg_chr, 3)
-                history["cache_hit_prior_avg"] = round(older_avg_chr, 3)
-                if older_avg_chr - recent_avg_chr > 0.10 and older_avg_chr > 0.4:
+            def _calc_effective_chr(sess_list):
+                # Prefer token-weighted cache hit rate: total_cache_read / total_input
+                tot_in = sum(s.get("input_tokens", 0) for s in sess_list)
+                tot_cr = sum(s.get("input_tokens", 0) * (s.get("cache_hit_rate", 0) or 0) for s in sess_list)
+                if tot_in > 0:
+                    return tot_cr / tot_in
+                eligible = [s.get("cache_hit_rate", 0) for s in sess_list if s.get("cache_hit_rate") is not None and s.get("api_calls", 0) >= 10]
+                if eligible:
+                    return sum(eligible) / len(eligible)
+                all_chr = [s.get("cache_hit_rate", 0) for s in sess_list if s.get("cache_hit_rate") is not None]
+                return (sum(all_chr) / len(all_chr)) if all_chr else 0.0
+
+            recent_avg_chr = _calc_effective_chr(recent_sessions)
+            older_avg_chr = _calc_effective_chr(older_sessions)
+            history["cache_hit_recent_avg"] = round(recent_avg_chr, 3)
+            history["cache_hit_prior_avg"] = round(older_avg_chr, 3)
+            if older_avg_chr - recent_avg_chr > 0.10 and older_avg_chr > 0.4:
                     if multi_model_pct > 25:
                         patterns_bad.append({
                             "name": "Cache Hit Rate Dropping (Model Switches)",
@@ -31612,14 +31614,15 @@ def _read_plugin_version(default="0.0.0"):
     """
     here = Path(__file__).resolve()
     for base in here.parents:
-        candidate = base / ".claude-plugin" / "plugin.json"
-        try:
-            if candidate.is_file():
-                value = json.loads(candidate.read_text(encoding="utf-8")).get("version")
-                if isinstance(value, str) and value.strip():
-                    return value.strip()
-        except (OSError, ValueError):
-            return default
+        for rel in (".claude-plugin/plugin.json", "plugin.json", ".codex-plugin/plugin.json"):
+            candidate = base / rel
+            try:
+                if candidate.is_file():
+                    value = json.loads(candidate.read_text(encoding="utf-8")).get("version")
+                    if isinstance(value, str) and value.strip():
+                        return value.strip()
+            except (OSError, ValueError):
+                continue
     return default
 
 
@@ -31631,7 +31634,12 @@ _DASHBOARD_CSP = "default-src 'none'; script-src 'unsafe-inline'; style-src 'uns
 # for foreign runtimes in _CLAUDE_TARGET_CMDS, so this is defense-in-depth.
 _DAEMON_RUNTIME = detect_runtime()
 _DAEMON_SUFFIX_BY_RUNTIME = {"codex": "codex", "hermes": "hermes", "copilot": "copilot", "cursor": "cursor", "antigravity": "antigravity", "grok": "grok"}
-_DAEMON_PORT_BY_RUNTIME = {"codex": 24843, "hermes": 24844, "copilot": 24845, "cursor": 24846, "antigravity": 24847, "grok": 24848}
+# NOTE (wizardinglab fork): the Hermes slot was moved from upstream's 24844 to
+# 24846 so the Hermes dashboard never collides with the Antigravity daemon on
+# 24847 (the operator's reserved slot). 24846 is nominally Cursor's slot;
+# no Cursor Token Optimizer install exists on these hosts, so the overlap is
+# inert. If a Cursor install is ever added here, give Cursor its own port.
+_DAEMON_PORT_BY_RUNTIME = {"codex": 24843, "hermes": 24846, "copilot": 24845, "cursor": 24846, "antigravity": 24847, "grok": 24848}
 _DAEMON_RUNTIME_SUFFIX = _DAEMON_SUFFIX_BY_RUNTIME.get(_DAEMON_RUNTIME, "claude")
 DAEMON_LABEL = (
     f"com.token-optimizer.{_DAEMON_RUNTIME_SUFFIX}-dashboard"
@@ -58346,9 +58354,10 @@ if __name__ == "__main__":
         # fire-and-forget, so cap it and fail open (the next Stop re-collects
         # idempotently).
         quiet = "--quiet" in args or "-q" in args
+        rebuild = "--rebuild" in args or "--force" in args
         _tok_hook_deadline = _install_hook_budget(60)
         try:
-            _collect_antigravity_sessions(days=90, quiet=quiet)
+            _collect_antigravity_sessions(days=90, quiet=quiet, rebuild=rebuild)
         except _HookTimeout:
             pass
         except Exception:

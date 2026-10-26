@@ -59,6 +59,7 @@ _RUNTIME_MODULES = (
     # time. Omitting it made the plugin dir import-fail at runtime even
     # though hermes-doctor's bridge smoke test caught it as ModuleNotFoundError.
     "spawn_utils.py",
+    "auto_heal.py",
 )
 
 # Engine scripts the plugin runs as child processes from THIS checkout (found

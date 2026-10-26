@@ -59,7 +59,7 @@ def test_pre_tool_use_rewrites_whitelisted_run_command(ab):
     # skips Windows `powershell`). Assert the platform contract instead of
     # skipping, so the Windows leg still exercises the handler end-to-end.
     if os.name == "nt":
-        assert out == {}
+        assert out == {"decision": "allow"}
         return
     assert out["decision"] == "ask"
     assert "bash_compress.py" in out["overwrite"]["CommandLine"]
@@ -180,7 +180,7 @@ def test_main_consent_grants_rewrite(ab, monkeypatch, capsys, tmp_path):
     # POSIX-only rewrite; on Windows the bridge no-ops with an empty object
     # (see test_pre_tool_use_rewrites_whitelisted_run_command).
     if os.name == "nt":
-        assert out == {}
+        assert out == {"decision": "allow"}
         return
     assert out["decision"] == "ask"
 

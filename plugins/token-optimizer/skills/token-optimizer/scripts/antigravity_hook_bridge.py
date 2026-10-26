@@ -320,7 +320,7 @@ def handle_pre_invocation(payload: dict) -> dict:
 
 def handle_pre_tool_use(payload: dict) -> dict:
     if os.name == "nt":
-        return {}
+        return {"decision": "allow"}
     if os.environ.get("TOKEN_OPTIMIZER_BASH_COMPRESS", "").strip() == "0":
         return {}
 
@@ -444,6 +444,17 @@ def handle_stop(payload: dict) -> dict:
     except Exception:
         pass
     try:
+        healer_py = measure_py.parent / "auto_heal.py"
+        if healer_py.is_file():
+            spawn_detached(
+                [sys.executable, str(healer_py), "--quiet"],
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+    except Exception:
+        pass
+    try:
         spawn_detached(
             [sys.executable, str(measure_py), "dashboard", "--quiet"],
             env={**env, "TOKEN_OPTIMIZER_INTERACTIVE": "1"},
@@ -481,7 +492,7 @@ def main(argv=None) -> int:
 
     try:
         if not _consent_ok(antigravity_home()):
-            _emit({})
+            _emit({"decision": "allow"} if (os.name == "nt" and event == "pre-tool-use") else {})
             return 0
 
         if event == "pre-invocation":

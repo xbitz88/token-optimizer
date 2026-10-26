@@ -279,7 +279,7 @@ def normalize_session(raw: dict) -> Optional[dict]:
     duration_minutes = 0.0
     if st is not None and et is not None:
         try:
-            duration_minutes = max(0.0, (float(et) - float(st)) / 60.0)
+            duration_minutes = min(1440.0, max(0.0, (float(et) - float(st)) / 60.0))
         except (TypeError, ValueError):
             duration_minutes = 0.0
 

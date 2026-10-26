@@ -65,6 +65,7 @@ _PAYLOAD_MODULES = (
     # credential_patterns: bash_compress's credential-preservation patterns
     # (the inline fallback misses e.g. ghp_/github_pat_ tokens, #171).
     "credential_patterns.py",
+    "auto_heal.py",
 )
 
 
