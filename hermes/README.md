@@ -10,7 +10,7 @@ Native Python plugin. Reads Hermes's own `~/.hermes/state.db` read-only. Model-a
 - **Proactive context nudge** via `pre_llm_call`: injects a one-line warning into the next turn when estimated context usage reaches ~70% of the model's window. Fires at most once per session to avoid spam; the gate never re-arms inside a session.
 - **Session rollup** via `on_session_finalize` and `on_session_end`: when a session ends, the plugin reads the final sessions row from `state.db` and writes it into Token Optimizer's shared `trends.db`. A double-rollup guard ensures only one subprocess fires even when both hooks arrive for the same session.
 - **`/token-optimizer` slash command**: shows a token and cost summary for the most recent Hermes sessions, available inside Hermes at any time.
-- **`hermes token-optimizer` CLI subcommand**: opens the dashboard at `http://localhost:24844`.
+- **`hermes token-optimizer` CLI subcommand**: opens the dashboard at `http://localhost:24846`.
 - **Dashboard**: the same shared Token Optimizer dashboard (Overview, Quality, Waste, Sessions, Daily tabs) served from the shared engine, populated with Hermes session data.
 
 ## Install
@@ -67,8 +67,8 @@ Once the plugin is installed and allow-listed in `plugins.enabled`, the hooks ac
 | Surface | How to use |
 |---------|-----------|
 | `/token-optimizer` | Slash command inside any Hermes session. Prints a token and cost summary for recent sessions. |
-| `hermes token-optimizer` | CLI subcommand run from your shell. Opens the dashboard at `http://localhost:24844`. Pass `--port <n>` to override the port. |
-| Dashboard | Visit `http://localhost:24844` after launching via the CLI subcommand, or open it from the main Token Optimizer dashboard if you run Claude Code or Codex alongside Hermes. |
+| `hermes token-optimizer` | CLI subcommand run from your shell. Opens the dashboard at `http://localhost:24846`. Pass `--port <n>` to override the port. |
+| Dashboard | Visit `http://localhost:24846` after launching via the CLI subcommand, or open it from the main Token Optimizer dashboard if you run Claude Code or Codex alongside Hermes. |
 
 ## The Context Nudge
 
@@ -157,8 +157,8 @@ Hermes turn lifecycle
         ──► measure.py hermes-summary  ──► usage_trends()
 
 hermes token-optimizer CLI
-    ──► hermes_hook_bridge.run_dashboard(port=24844)
-        ──► dashboard served at http://localhost:24844
+    ──► hermes_hook_bridge.run_dashboard(port=24846)
+        ──► dashboard served at http://localhost:24846
 ```
 
 Session data flows one way: from Hermes's `state.db` into Token Optimizer's `trends.db`. The plugin never writes back to `state.db`.

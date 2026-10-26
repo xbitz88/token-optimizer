@@ -30,10 +30,14 @@ from runtime_env import runtime_home
 from spawn_utils import spawn_detached
 
 # Dashboard port constant — single source of truth.
+#
+# NOTE (wizardinglab fork): upstream ships 24844; this fork uses 24846.
+# hermes_doctor.py is not part of the installed plugin payload, so this
+# fallback is the value that applies at runtime.
 try:
     from hermes_doctor import DASHBOARD_PORT  # noqa: PLC0415
 except Exception:
-    DASHBOARD_PORT = 24844
+    DASHBOARD_PORT = 24846
 
 logger = logging.getLogger(__name__)
 

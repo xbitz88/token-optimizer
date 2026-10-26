@@ -300,7 +300,7 @@ def test_uninstall_reclaims_the_daemon_port(measure, tmp_path, monkeypatch):
 
     measure._uninstall_launchd_daemon()  # default = sweep all identities
 
-    assert set(ports) == {24842, 24843, 24844, 24845, 24846, 24847, 24848}, (
+    assert set(ports) == {24842, 24843, 24845, 24846, 24847, 24848}, (
         "uninstall did not reclaim every runtime's daemon port -- a sibling "
         "runtime's daemon keeps serving its CSRF token"
     )

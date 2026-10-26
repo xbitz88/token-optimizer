@@ -161,10 +161,20 @@ _NUDGE_THRESHOLD = 0.70
 _DEFAULT_CONTEXT_WINDOW = 200_000
 
 # Dashboard port — single source of truth lives in hermes_doctor.DASHBOARD_PORT.
+#
+# NOTE (wizardinglab fork): upstream ships 24844. This fork serves the Hermes
+# dashboard on 24846 because the Windows host already runs the Antigravity
+# runtime daemon on 24847 and the operator reserved the lower slots.
+#
+# hermes_doctor.py is NOT copied into the plugin install dir (it is not in
+# hermes_install._RUNTIME_MODULES), so the import above always fails at
+# runtime and the fallback below is the value that actually applies. Keep it
+# in sync with hermes_doctor.DASHBOARD_PORT and measure.py's
+# _DAEMON_PORT_BY_RUNTIME.
 try:
     from hermes_doctor import DASHBOARD_PORT as _DASHBOARD_PORT  # noqa: PLC0415
 except Exception:
-    _DASHBOARD_PORT = 24844
+    _DASHBOARD_PORT = 24846
 
 
 def _context_window(model: str) -> int:

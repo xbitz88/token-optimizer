@@ -337,7 +337,7 @@ _FOREIGN_RUNTIMES = frozenset({"opencode", "copilot", "hermes", "cursor", "antig
 # (hermes/__init__.py:419 -> hermes_hook_bridge.py:222) shells to
 # ``python3 measure.py dashboard`` with TOKEN_OPTIMIZER_RUNTIME=hermes as the
 # ``hermes token-optimizer`` CLI command. The dashboard is hermes-aware — its
-# daemon identity is runtime-suffixed (port 24844, label
+# daemon identity is runtime-suffixed (port 24846, label
 # com.token-optimizer.hermes-dashboard; see _DAEMON_PORT_BY_RUNTIME), and
 # measure_components() routes to _measure_hermes_components() (no ~/.claude
 # scan), and _find_all_jsonl_files() returns [] under hermes (sessions come
@@ -498,7 +498,7 @@ def _hermes_audit_notice() -> None:
     print("  measure.py hermes-rollup     — collect sessions into trends")
     print("  measure.py hermes-doctor     — readiness + hook capability probe")
     print("  measure.py hermes-install    — wire Token Optimizer into ~/.hermes/plugins/")
-    print("  measure.py dashboard         — open the Hermes dashboard (port 24844)")
+    print("  measure.py dashboard         — open the Hermes dashboard (port 24846)")
     print()
     print("To force this skill onto a specific runtime, set TOKEN_OPTIMIZER_RUNTIME.")
 
@@ -7349,8 +7349,8 @@ def _collect_hermes_hook_status_for_dashboard():
         },
         "hermes_dashboard_port": {
             "installed": _ok(f"Dashboard port {hermes_doctor.DASHBOARD_PORT}"),
-            "label": "Dashboard Port 24844",
-            "description": "Confirms that port 24844 is available or already serving the Hermes Token Optimizer dashboard.",
+            "label": "Dashboard Port 24846",
+            "description": "Confirms that port 24846 is available or already serving the Hermes Token Optimizer dashboard.",
             "install_cmd": f"{_runtime_cli('hermes')} open-dashboard",
             "uninstall_cmd": "",
         },
@@ -31029,7 +31029,12 @@ _DASHBOARD_CSP = "default-src 'none'; script-src 'unsafe-inline'; style-src 'uns
 # for foreign runtimes in _CLAUDE_TARGET_CMDS, so this is defense-in-depth.
 _DAEMON_RUNTIME = detect_runtime()
 _DAEMON_SUFFIX_BY_RUNTIME = {"codex": "codex", "hermes": "hermes", "copilot": "copilot", "cursor": "cursor", "antigravity": "antigravity", "grok": "grok"}
-_DAEMON_PORT_BY_RUNTIME = {"codex": 24843, "hermes": 24844, "copilot": 24845, "cursor": 24846, "antigravity": 24847, "grok": 24848}
+# NOTE (wizardinglab fork): the Hermes slot was moved from upstream's 24844 to
+# 24846 so the Hermes dashboard never collides with the Antigravity daemon on
+# 24847 (the operator's reserved slot). 24846 is nominally Cursor's slot;
+# no Cursor Token Optimizer install exists on these hosts, so the overlap is
+# inert. If a Cursor install is ever added here, give Cursor its own port.
+_DAEMON_PORT_BY_RUNTIME = {"codex": 24843, "hermes": 24846, "copilot": 24845, "cursor": 24846, "antigravity": 24847, "grok": 24848}
 _DAEMON_RUNTIME_SUFFIX = _DAEMON_SUFFIX_BY_RUNTIME.get(_DAEMON_RUNTIME, "claude")
 DAEMON_LABEL = (
     f"com.token-optimizer.{_DAEMON_RUNTIME_SUFFIX}-dashboard"
