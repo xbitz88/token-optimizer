@@ -210,6 +210,19 @@ def run_rollup(
         )
     except Exception as exc:
         logger.debug("[hermes_hook_bridge] run_rollup Popen error: %s", exc)
+    try:
+        auto_heal_py = Path(__file__).resolve().parent / "auto_heal.py"
+        if not auto_heal_py.is_file():
+            auto_heal_py = Path(__file__).resolve().parent / "skills" / "token-optimizer" / "scripts" / "auto_heal.py"
+        if auto_heal_py.is_file():
+            spawn_detached(
+                [sys.executable, str(auto_heal_py), "--quiet"],
+                env={**os.environ, "TOKEN_OPTIMIZER_RUNTIME": "hermes"},
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+    except Exception as exc:
+        logger.debug("[hermes_hook_bridge] auto_heal spawn error: %s", exc)
         return
     if _proc is None:
         logger.warning("[hermes_hook_bridge] run_rollup spawn_detached returned None")

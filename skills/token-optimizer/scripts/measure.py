@@ -11029,8 +11029,9 @@ def generate_coach_data(focus=None, components=None, trends=None, include_determ
 
         # 2. Session duration creep
         if recent_sessions and older_sessions:
-            recent_durs = [s.get("duration_minutes", 0) for s in recent_sessions if s.get("duration_minutes")]
-            older_durs = [s.get("duration_minutes", 0) for s in older_sessions if s.get("duration_minutes")]
+            # Cap session duration at 1440 min (24h) to avoid idle multi-day outliers distorting averages
+            recent_durs = [min(1440.0, s.get("duration_minutes", 0)) for s in recent_sessions if s.get("duration_minutes")]
+            older_durs = [min(1440.0, s.get("duration_minutes", 0)) for s in older_sessions if s.get("duration_minutes")]
             if recent_durs and older_durs:
                 recent_avg_dur = sum(recent_durs) / len(recent_durs)
                 older_avg_dur = sum(older_durs) / len(older_durs)
@@ -11055,28 +11056,29 @@ def generate_coach_data(focus=None, components=None, trends=None, include_determ
                             "savings": "Not estimated: duration is not a token measure; compacting earlier reduces context fill",
                         })
                         score -= 5
-                    else:
-                        patterns_bad.append({
-                            "name": "Session Duration Creep",
-                            "severity": "low",
-                            "detail": f"Elapsed sessions averaging {recent_avg_dur:.0f} min (was {older_avg_dur:.0f} min); may include idle time and does not by itself indicate token waste",
-                            "fix": "If sessions are genuinely busier (not just idle), compact proactively around the midpoint",
-                            "savings": "Not estimated: elapsed session duration includes idle time and does not measure token waste",
-                        })
 
         # 3. Cache hit rate degradation (model-switch aware)
         multi_model_recent = sum(1 for s in recent_sessions if s.get("model_count", 1) > 1)
         multi_model_pct = (multi_model_recent / len(recent_sessions) * 100) if recent_sessions else 0
         history["multi_model_session_pct"] = round(multi_model_pct, 1)
         if recent_sessions and older_sessions:
-            recent_chr = [s.get("cache_hit_rate", 0) for s in recent_sessions if s.get("cache_hit_rate") is not None]
-            older_chr = [s.get("cache_hit_rate", 0) for s in older_sessions if s.get("cache_hit_rate") is not None]
-            if recent_chr and older_chr:
-                recent_avg_chr = sum(recent_chr) / len(recent_chr)
-                older_avg_chr = sum(older_chr) / len(older_chr)
-                history["cache_hit_recent_avg"] = round(recent_avg_chr, 3)
-                history["cache_hit_prior_avg"] = round(older_avg_chr, 3)
-                if older_avg_chr - recent_avg_chr > 0.10 and older_avg_chr > 0.4:
+            def _calc_effective_chr(sess_list):
+                # Prefer token-weighted cache hit rate: total_cache_read / total_input
+                tot_in = sum(s.get("input_tokens", 0) for s in sess_list)
+                tot_cr = sum(s.get("input_tokens", 0) * (s.get("cache_hit_rate", 0) or 0) for s in sess_list)
+                if tot_in > 0:
+                    return tot_cr / tot_in
+                eligible = [s.get("cache_hit_rate", 0) for s in sess_list if s.get("cache_hit_rate") is not None and s.get("api_calls", 0) >= 10]
+                if eligible:
+                    return sum(eligible) / len(eligible)
+                all_chr = [s.get("cache_hit_rate", 0) for s in sess_list if s.get("cache_hit_rate") is not None]
+                return (sum(all_chr) / len(all_chr)) if all_chr else 0.0
+
+            recent_avg_chr = _calc_effective_chr(recent_sessions)
+            older_avg_chr = _calc_effective_chr(older_sessions)
+            history["cache_hit_recent_avg"] = round(recent_avg_chr, 3)
+            history["cache_hit_prior_avg"] = round(older_avg_chr, 3)
+            if older_avg_chr - recent_avg_chr > 0.10 and older_avg_chr > 0.4:
                     if multi_model_pct > 25:
                         patterns_bad.append({
                             "name": "Cache Hit Rate Dropping (Model Switches)",

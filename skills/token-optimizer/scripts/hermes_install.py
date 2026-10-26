@@ -59,6 +59,7 @@ _RUNTIME_MODULES = (
     # time. Omitting it made the plugin dir import-fail at runtime even
     # though hermes-doctor's bridge smoke test caught it as ModuleNotFoundError.
     "spawn_utils.py",
+    "auto_heal.py",
 )
 
 # Plain-text locator file written into the plugin dir: one line, the absolute

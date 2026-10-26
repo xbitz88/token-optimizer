@@ -568,7 +568,7 @@ def normalize_session(row: dict[str, Any], *, context_tokens: int | None = None)
     duration_minutes = 0.0
     if started_at_raw is not None and ended_at_raw is not None:
         try:
-            duration_minutes = max(0.0, (float(ended_at_raw) - float(started_at_raw)) / 60.0)
+            duration_minutes = min(1440.0, max(0.0, (float(ended_at_raw) - float(started_at_raw)) / 60.0))
         except (TypeError, ValueError):
             duration_minutes = 0.0
 
