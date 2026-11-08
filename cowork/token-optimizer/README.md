@@ -265,7 +265,7 @@ These ten rows are the ones where Token Optimizer is the only 🟢 in the row: w
 
 |  | Token Optimizer | Headroom | RTK | Boost | context-mode | `/context` |
 |---|---|---|---|---|---|---|
-| Session continuity | 🟢 Progressive checkpoints before compaction + restore after, cross-session hints, cold-resume, tool-output digest; measured ~3.9M tokens / ~$19 recovered in a 30-day snapshot (checkpoint restores + lean resumes) | 🔴 | 🔴 | — | 🟡 Session guide only | 🔴 |
+| Session continuity | 🟢 Progressive checkpoints before compaction + restore after, cross-session hints, cold-resume, tool-output digest | 🔴 | 🔴 | — | 🟡 Session guide only | 🔴 |
 | Structural waste audit | 🟢 Deep per-component (CLAUDE.md, skills, MCP, memory) | 🔴 | 🔴 | 🔴 | 🔴 | 🟡 Summary only |
 | CLAUDE.md and MEMORY.md health | 🟢 8 auditors + attention-curve scoring | 🔴 | 🔴 | 🔴 | 🔴 | 🔴 |
 | Model routing and behavioral coaching | 🟢 12 detectors, subagent cost breakdown, anti-patterns | 🔴 | 🔴 | — | 🔴 | 🟡 Basic suggestions |
@@ -311,21 +311,22 @@ Per-turn token breakdowns, cost across four pricing tiers, cache analysis with T
 
 ## What It Saves
 
-Six levers, all automatic: tool-output compression, cross-turn dedup, delta-read, structure-map skeletons, checkpoint-restore, and model routing. What they save is tracked in three tiers.
+**About $597.72 in all-in API-rate-equivalent value, a priced subtotal for the 30-day snapshot ending 2026-11-01.** The components keep their evidence labels:
 
-**Three tiers, labelled by how each is known** (one real month, the author's last 30 days, all six levers on):
+- **Logged actions: $78.59.** Metered token changes across 4,945 events, valued at API rates.
+- **Model routing: $422.88.** Estimated comparison using a frozen pre-tool mix and fixed reference model cards.
+- **Repeat reads avoided: $60.69.** Modeled from observed turns until the next real compaction, using known per-turn rates.
+- **Other estimates: $35.56.** All eight estimate categories are listed in the [methodology](BENCHMARK.md), including zero-valued categories.
 
-- **Logged actions (\~$126)**, metered. Every saving logged as it happened: a result archived, a repeat read skipped, a lean resume, a loop cut short. 2,733 events with before and after token counts.
-- **Repeat reads avoided (\~$1,124)**, estimated. Content Token Optimizer removed would have been re-read on every later turn until the session's next real compaction, modelled per turn at that turn's cache-read rate and capped at the real compaction event.
-- **Other estimates (\~$146)**, estimated. Lean session resumes, compressed sub-agent context, MCP output caps, loops prevented.
+**Pricing is incomplete.** Unpriced repeat-read credits and debits are excluded; the complete net dollar value is unavailable. The four components add up to the total.
 
-About **\~$1,396** in API-equivalent value for the month, and **59.6M tokens never sent to the model**, roughly 28% of the workload (150.8M spent, about 210.4M without Token Optimizer). Tokens are the primary figure; dollars depend on which models you run. Metered and estimated are never dressed up as one number. [See the full methodology →](BENCHMARK.md)
+The same snapshot's token card shows **24.80M tokens saved** (9,831,072 metered + 14,966,284 estimated), about **8% of spent + saved**: 286.22M spent + 24.80M saved = 311.02M. Its scope is logged tokens plus MCP caps, hint-served reads, verbosity nudges and lean resumes (snapshot taken under v5.13.63 rules; checkpoint restores have since moved to the estimated tier). Modeled repeat-read tokens and routing are outside that token-card total; the dollar subtotal has the broader scope above.
 
 <p align="center">
-  <img src="skills/token-optimizer/assets/real-savings.svg" alt="30-day savings report: about $1,396 in API-equivalent value and 59.6M tokens never sent, split into $126 logged actions (metered), $1,124 repeat reads avoided (estimated) and $146 other estimates" width="900">
+  <img src="skills/token-optimizer/assets/real-savings.svg" alt="Snapshot 2026-11-01: $597.72 priced API-rate-equivalent subtotal with incomplete pricing; 24.80M tokens saved, about 8% of spent plus saved. Logged actions $78.59, estimated routing $422.88, modeled rereads $60.69, other estimates $35.56." width="900">
 </p>
 
-Based on 1,698 sessions over the last 30 days (snapshot 2026-09-14). Your number is your own: the dashboard computes the same report from your own sessions. [See the methodology →](BENCHMARK.md)
+Based on 1,644 main work sessions and 3 delegated sessions. Your dashboard computes the report from your own history; results differ. [Full methodology →](BENCHMARK.md)
 
 <p align="center">
   <img src="skills/token-optimizer/assets/user-profiles.svg" alt="What happens inside a 1M session" width="800">
@@ -335,7 +336,7 @@ Based on 1,698 sessions over the last 30 days (snapshot 2026-09-14). Your number
 
 Nine features that actively reduce context, all on by default, all automatic, all toggleable from the dashboard or CLI.
 
-Under the hood, **PreToolUse hooks** intercept every Read and Bash call before it enters your context. If the file was already read, only the diff comes back. If it's a code file re-read, a structural skeleton replaces the full content. If it's a CLI command, the output is compressed. **PostToolUse hooks** archive the full original to disk and log a compression event to SQLite. Nothing is lost, and everything is retrievable. **You do nothing. The hooks handle it all.**
+Under the hood, **PreToolUse hooks** intercept every Read call before it enters your context. If the file was already read, only the diff comes back. If it's a code file re-read, a structural skeleton replaces the full content. **PostToolUse hooks** compress CLI command output, archive the full original to disk, and log a compression event to SQLite. Nothing is lost, and everything is retrievable. **You do nothing. The hooks handle it all.**
 
 ![Active Compression overview](skills/token-optimizer/assets/active-compression-hero.svg)
 
@@ -498,12 +499,21 @@ This isn't just storage. The system tracks how many results were archived vs re-
 python3 measure.py expand --list          # List archived tool results
 python3 measure.py expand <tool-use-id>   # Retrieve a specific result
 python3 measure.py expand --search <query>  # Search archived results by keyword/lineage
+python3 measure.py expand <id> --lines 50:120        # Just lines 50-120 of the archive
+python3 measure.py expand <id> --start 4000 --chars 2000  # A 2KB char window
+python3 measure.py expand <id> --match "ERROR" --context 3  # Literal-substring context windows
 ```
 
+`--match` is a literal substring (`grep -F` semantics), not a regex, and line
+numbers count `\n` breaks the way `grep -n`/`sed -n` do.
+
 `expand --search` runs a full-text search (FTS5 with a `LIKE` fallback) over
-archived tool outputs, including the full response body, tool name, command,
-source file path, language, and archive origin. Each match prints the key,
-lineage, and a snippet. Use `expand <key>` to retrieve the full content.
+the entire archived response body — not just a prefix — plus tool name,
+command, source file path, language, and archive origin. Each hit prints the
+key, lineage, capture time, content hash, total length, truncation state, and
+a snippet. `expand <key>` still returns the full stored output; the bounded
+flags above return only the requested window, print a command for the next
+window, and debit re-expansion savings only for the tokens actually returned.
 
 Some MCP tools are *documented* to return large verbatim payloads (source fetchers, doc retrievers) where a metadata preview defeats the point. Allowlist those so their full result reaches context instead of being replaced (it's still archived, so `expand` works). Set a comma-separated list of `fnmatch` globs matched against the full tool name:
 
@@ -521,7 +531,7 @@ When you end a session, Token Optimizer checkpoints your state to SQLite: active
 
 - **Cross-session hints**: relevance-scored checkpoints surface when you start a new session. The hint includes the prior session's task, decisions, files, and branch. All fenced as RECOVERED DATA, never instructions.
 - **Cold-resume-lean**: reopen a stale session without paying the full transcript cost. Token Optimizer reconstructs a lean context from its checkpoint. No LLM call, no full-transcript cold-resume. Token-free reconstruction from SQLite.
-- **Hint-follow measurement**: when a continuity hint surfaces file paths and the model subsequently reads one, Token Optimizer credits an avoided exploratory search. Measured causality, not a guess.
+- **Hint-follow estimate**: when a continuity hint surfaces file paths and the model subsequently reads one, Token Optimizer estimates an avoided exploratory search. The hint->read pair is observed; the avoided-search size is a fixed estimate, reported in the estimated tier, not the measured total.
 
 ```bash
 python3 measure.py resume-lean                    # list reopenable cold sessions
@@ -532,7 +542,7 @@ Compression savings only stick if your session survives compaction. Session cont
 
 ## Smart Compaction
 
-When auto-compact fires, 60-70% of your conversation vanishes. Decisions, error-fix sequences, agent state, all gone.
+Auto-compact rewrites the conversation into a summary. How much useful detail survives depends on the compaction and the restore, not on a fixed percentage: the paired-window event study in `research/arxiv-2611.05306/` measured real sessions and found compaction count alone does not predict recovery quality. What Token Optimizer measures instead is what happens *after* each boundary: whether the restore was delivered, whether tool errors spike, whether the session re-reads unchanged files, repeats failed actions, or falls into loops. This release logs that evidence for calibration and shows a neutral `observing` status on every surface. Missing evidence stays unknown, and compaction count carries no quality penalty.
 
 Token Optimizer checkpoints your session before compaction and restores what the summary dropped, automatically, via hooks. It also injects a **context intel digest**: heuristic summaries of large tool outputs the model already processed (file paths touched, errors seen, line counts). After compaction, the model knows what it saw without re-reading everything.
 
@@ -601,8 +611,9 @@ python3 measure.py setup-quality-bar      # one-time install
 
 | Score | Signals | What it means |
 |--------|--------|----------------|
-| **Resource Health** | Context fill, compaction depth, absolute waste tokens | How close you are to the degradation cliff |
+| **Resource Health** | Context fill, absolute waste tokens | How close you are to the degradation cliff |
 | **Session Efficiency** | Stale reads, bloated results, decision density, agent efficiency | Whether the session is using tokens well right now |
+| **Compaction recovery** | Restore delivery, post-boundary errors, re-reads, repeats, loops (matched 20-call windows) | Whether the session actually recovered after each compaction; count alone carries no weight |
 
 | Grade | Range | Meaning |
 |-------|-------|---------|

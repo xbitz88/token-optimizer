@@ -121,9 +121,9 @@ export function buildTooltip(s: Snapshot, opts: RenderOptions): string {
   lines.push('');
 
   if (isFunnel(s)) {
-    lines.push('_Save 15–20% on every session — three levels of optimization, quality kept intact._');
+    lines.push('_Track token savings across three levels of optimization._');
     lines.push('');
-    lines.push('Scales with use: ~**$150/mo** light → up to **~$1,900/mo** power (API-equivalent, metered on real data).');
+    lines.push('See your savings in the Token Optimizer dashboard after installing the CLI plugin.');
     lines.push('');
     lines.push(`**[Install Token Optimizer →](${INSTALL_CMD})**`);
     return lines.join('\n');
@@ -159,8 +159,7 @@ export function buildTooltip(s: Snapshot, opts: RenderOptions): string {
 
   if (s.compactions != null) {
     if (s.compactions > 0) {
-      const loss = s.compactionLossPct != null ? ` (~${s.compactionLossPct}% lost)` : '';
-      lines.push(`| Compactions | ${s.compactions}${loss} |`);
+      lines.push(`| Compactions | ${s.compactions} (observing) |`);
     } else {
       lines.push(`| Compactions | 0 |`);
     }
@@ -216,7 +215,7 @@ export interface PanelModel {
   eff: { score: number; grade: string } | null;
   qualityPending: boolean;
   warnings: string[];
-  compactions: { count: number; lossPct: number | null } | null;
+  compactions: { count: number; recovery: string | null } | null;
   duration: string;
   agents: string[];
   fiveHour: PanelUsageWindow | null;
@@ -246,7 +245,7 @@ export function buildPanelModel(s: Snapshot, opts: RenderOptions): PanelModel {
     qualityPending: qualityPending(s),
     warnings: warningParts(s),
     compactions:
-      s.compactions != null ? { count: s.compactions, lossPct: s.compactionLossPct } : null,
+      s.compactions != null ? { count: s.compactions, recovery: s.compactionRecovery } : null,
     duration: formatDuration(s.durationSec),
     agents: s.agents.map((a) => `${a.model}:${a.description}${a.elapsed ? ` (${a.elapsed})` : ''}`),
     fiveHour: s.rateLimits?.fiveHour ? panelUsageWindow(s.rateLimits.fiveHour, opts.nowMs, s.rateLimitsStale) : null,

@@ -11,6 +11,7 @@ Run: python3 -m pytest tests/test_grok_adapter.py -v
 """
 
 from __future__ import annotations
+from helpers.measure_split import exec_source_module as _split_exec_module
 
 import json
 import os
@@ -473,7 +474,7 @@ def test_grok_install_uses_shared_trust_gate(gi, monkeypatch, tmp_path):
     assert resolved == os.path.realpath(sentinel)
 
 
-@pytest.mark.skipif(os.name == "nt", reason="Grok install refuses native Windows (POSIX-shell quoted command)")
+@pytest.mark.skipif(os.name == "nt", reason="asserts the POSIX command form and file modes")
 def test_install_writes_our_five_event_hooks_file(gi, tmp_path):
     home = tmp_path / "grok-home"
     result = gi.install(home=home)
@@ -493,7 +494,7 @@ def test_install_writes_our_five_event_hooks_file(gi, tmp_path):
     assert (home / "token-optimizer" / "plugin" / "measure-path").is_file()
 
 
-@pytest.mark.skipif(os.name == "nt", reason="Grok install refuses native Windows (POSIX-shell quoted command)")
+@pytest.mark.skipif(os.name == "nt", reason="asserts the POSIX command form and file modes")
 def test_uninstall_removes_only_our_files(gi, tmp_path):
     home = tmp_path / "grok-home"
     gi.install(home=home)
@@ -630,7 +631,7 @@ def test_bash_whitelist_in_payload_modules(gi):
     )
 
 
-@pytest.mark.skipif(os.name == "nt", reason="Grok install refuses native Windows (POSIX-shell quoted command)")
+@pytest.mark.skipif(os.name == "nt", reason="asserts the POSIX command form and file modes")
 def test_install_copies_bash_whitelist(gi, tmp_path):
     """install() must actually place bash_whitelist.py next to the bridge."""
     home = tmp_path / "grok-home"
@@ -641,7 +642,7 @@ def test_install_copies_bash_whitelist(gi, tmp_path):
     import importlib.util
     spec = importlib.util.spec_from_file_location("bw_check", whitelist)
     mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    _split_exec_module(mod)
     assert hasattr(mod, "is_whitelisted"), (
         "installed bash_whitelist.py is not the real module"
     )
@@ -652,7 +653,7 @@ def test_install_copies_bash_whitelist(gi, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(os.name == "nt", reason="Grok install refuses native Windows (POSIX-shell quoted command)")
+@pytest.mark.skipif(os.name == "nt", reason="asserts the POSIX command form and file modes")
 def test_dashboard_collector_toggle_names_match_doctor(gd, gi, monkeypatch, tmp_path):
     """Every dashboard toggle must look up a check name the doctor actually
     emits, with the correct lowercase status. Before the fix, the collector
@@ -693,7 +694,7 @@ def test_dashboard_collector_toggle_names_match_doctor(gd, gi, monkeypatch, tmp_
         )
 
 
-@pytest.mark.skipif(os.name == "nt", reason="Grok install refuses native Windows (POSIX-shell quoted command)")
+@pytest.mark.skipif(os.name == "nt", reason="asserts the POSIX command form and file modes")
 def test_dashboard_collector_no_capability_toggle(gd, gi, monkeypatch, tmp_path):
     """The collector must NOT have a grok_capabilities toggle — grok_doctor
     has no capability matrix check. A toggle looking up a non-existent check
@@ -711,7 +712,7 @@ def test_dashboard_collector_no_capability_toggle(gd, gi, monkeypatch, tmp_path)
     )
 
 
-@pytest.mark.skipif(os.name == "nt", reason="Grok install refuses native Windows (POSIX-shell quoted command)")
+@pytest.mark.skipif(os.name == "nt", reason="asserts the POSIX command form and file modes")
 def test_dashboard_collector_port_label_matches_grok_port(gd, gi, monkeypatch, tmp_path):
     """The dashboard port toggle must reference grok's own port (24848), not
     antigravity's port (24847) which was copy-pasted."""
@@ -745,3 +746,41 @@ def test_dashboard_collector_port_label_matches_grok_port(gd, gi, monkeypatch, t
         "grok_doctor doesn't emit a 'dashboard daemon' check — "
         "the port toggle lookup name is wrong"
     )
+
+
+_FILTERS_PAYLOAD_PROBE = r'''
+import os, sys, importlib.abc
+class _NoStdlibToml(importlib.abc.MetaPathFinder):
+    def find_spec(self, name, path=None, target=None):
+        if name == "tomllib":
+            raise ImportError("simulated Python 3.9/3.10")
+sys.meta_path.insert(0, _NoStdlibToml())
+sys.path.insert(0, sys.argv[1])
+os.environ["TOKEN_OPTIMIZER_COMMAND_FILTERS"] = sys.argv[2]
+import command_filters
+print(command_filters.load_filters().excludes)
+'''
+
+
+@pytest.mark.skipif(os.name == "nt", reason="asserts the POSIX install layout")
+def test_payload_parses_command_filters_without_stdlib_tomllib(gi, tmp_path):
+    """command_filters + _tomli must ship in the payload: on Python 3.9/3.10
+    there is no tomllib, so the vendored _tomli module is its only TOML parser.
+    Without them the lazy import fails and user filters silently never apply;
+    a malformed filters file must still fail open with an empty config."""
+    import subprocess
+    home = tmp_path / "grok-home"
+    gi.install(home=home)
+    pdir = home / "token-optimizer" / "plugin"
+    good = tmp_path / "command-filters.toml"
+    good.write_text('[filters.exclude]\ncommands = ["git log"]\n')
+    bad = tmp_path / "bad-filters.toml"
+    bad.write_text("[[broken\n")
+    py = "/usr/bin/python3" if os.path.exists("/usr/bin/python3") else sys.executable
+    for path, want in ((good, "('git log',)"), (bad, "()")):
+        out = subprocess.run(
+            [py, "-c", _FILTERS_PAYLOAD_PROBE, str(pdir), str(path)],
+            capture_output=True, text=True, cwd=str(tmp_path), timeout=60,
+        )
+        assert out.returncode == 0, out.stderr
+        assert out.stdout.strip() == want, out.stdout + out.stderr

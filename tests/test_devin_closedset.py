@@ -1,3 +1,4 @@
+from helpers.measure_split import exec_source_module as _split_exec_module
 from pathlib import Path
 import os,sys,pytest
 pytestmark=pytest.mark.skipif(os.name != "posix", reason="POSIX adapter only")
@@ -157,7 +158,7 @@ def test_allowed_source_open_checks(tmp_path, monkeypatch, kind):
         reason={'symlink':'regular payload source required','oversize':'payload source exceeds bound'}.get(
             kind,'private regular payload source required')
         with pytest.raises((OSError,ImportError),match=reason):
-            spec=loader.find_spec('token_estimate');module=importlib.util.module_from_spec(spec);loader.exec_module(module)
+            spec=loader.find_spec('token_estimate');module=importlib.util.module_from_spec(spec);_split_exec_module(module)
 
 
 def test_real_installed_chain_and_stdlib_after_activation(tmp_path, monkeypatch):
@@ -266,7 +267,8 @@ def test_upgrade_clean_229_install(tmp_path, monkeypatch):
     baseline=tmp_path/'baseline'
     # The shipped baseline bytes are stored as a fixture so the upgrade path
     # does not depend on clone depth or object history.
-    shutil.copytree(fixture,baseline)
+    from _devin_baseline import copy_baseline
+    copy_baseline(fixture,baseline)
     run=subprocess.run([sys.executable,str(baseline/'skills/token-optimizer/scripts/devin_install.py'),'install'],env=dict(os.environ),capture_output=True,timeout=20)
     assert run.returncode==0,run.stderr
     d.install()
@@ -387,9 +389,9 @@ def test_v3_refused_repo_preloads_are_evicted(tmp_path,monkeypatch):
 from pathlib import Path
 root=Path(sys.argv[1]);namespace={}
 exec(compile((root/'devin_source.py').read_bytes(),str(root/'devin_source.py'),'exec'),namespace)
-for name in ('archive_result','measure','measure.child'):sys.modules[name]=types.ModuleType(name)
+for name in ('archive_result','measure','measure.child','_measure','_measure.pricing'):sys.modules[name]=types.ModuleType(name)
 namespace['activate'](root)
-for name in ('archive_result','measure','measure.child'):
+for name in ('archive_result','measure','measure.child','_measure','_measure.pricing'):
     assert name not in sys.modules
     try:__import__(name)
     except ImportError:pass
@@ -402,7 +404,7 @@ def test_v3_upgrade_from_v2_closure_and_failed_refresh_restore(tmp_path,monkeypa
     import devin_install as d,json,hashlib
     monkeypatch.setenv('HOME',str(tmp_path));d.install();root=d.state.data_dir()/'plugin';manifest=d.manifest_path()
     record=json.loads(manifest.read_text())
-    for name in ('plugin_env.py','refetch_fingerprint.py','devin_hooks.py'):
+    for name in ('plugin_env.py','refetch_fingerprint.py','devin_hooks.py','_tomli.py'):
         (root/name).unlink();del record['files'][str(root/name)]
     manifest.write_text(json.dumps(record))
     original=d._atomic
@@ -411,7 +413,7 @@ def test_v3_upgrade_from_v2_closure_and_failed_refresh_restore(tmp_path,monkeypa
         return original(path,content)
     monkeypatch.setattr(d,'_atomic',fail)
     with pytest.raises(OSError,match='interrupted'):d.install()
-    assert not any((root/name).exists() for name in ('plugin_env.py','refetch_fingerprint.py','devin_hooks.py'))
+    assert not any((root/name).exists() for name in ('plugin_env.py','refetch_fingerprint.py','devin_hooks.py','_tomli.py'))
     assert json.loads(manifest.read_text())==record
     for name,digest in record['files'].items():assert hashlib.sha256(Path(name).read_bytes()).hexdigest()==digest
     monkeypatch.setattr(d,'_atomic',original);d.install()
@@ -423,7 +425,7 @@ def test_v3_interrupted_closure_upgrade_recovers_new_leaves(tmp_path,monkeypatch
     import devin_install as d,json,base64
     monkeypatch.setenv('HOME',str(tmp_path));d.install();root=d.state.data_dir()/'plugin'
     intended=json.loads(d.manifest_path().read_text());old=dict(intended['files'])
-    for name in ('plugin_env.py','refetch_fingerprint.py','devin_hooks.py'):del old[str(root/name)]
+    for name in ('plugin_env.py','refetch_fingerprint.py','devin_hooks.py','_tomli.py'):del old[str(root/name)]
     old_manifest=json.dumps({'owner':d.MARKER,'files':old}).encode()
     previous={name:base64.b64encode(Path(name).read_bytes()).decode() for name in old}
     d.manifest_path().write_bytes(old_manifest)
@@ -431,7 +433,7 @@ def test_v3_interrupted_closure_upgrade_recovers_new_leaves(tmp_path,monkeypatch
     pending.write_text(json.dumps({'owner':d.MARKER,'files':intended['files'],'previous':previous,
                                   'previous_manifest':base64.b64encode(old_manifest).decode()}));pending.chmod(0o600)
     with d._lock():d._recover_pending()
-    assert not any((root/name).exists() for name in ('plugin_env.py','refetch_fingerprint.py','devin_hooks.py'))
+    assert not any((root/name).exists() for name in ('plugin_env.py','refetch_fingerprint.py','devin_hooks.py','_tomli.py'))
     d.install()
     from devin_verify import verify_install
     assert verify_install()
@@ -455,6 +457,8 @@ def test_v4_refusal_inventory_includes_packages():
     repo_names={p.stem for p in SCRIPTS.glob('*.py')}|{p.name for p in SCRIPTS.iterdir() if p.is_dir() and p.name!='__pycache__'}
     assert repo_names==devin_source.REPO_MODULES
     with pytest.raises(ImportError):devin_source.SourceOnly(SCRIPTS).find_spec('detectors')
+    for name in ('_measure', '_measure.pricing'):
+        with pytest.raises(ImportError):devin_source.SourceOnly(SCRIPTS).find_spec(name)
 
 
 @pytest.mark.parametrize('entry',['devin_compress.py','devin_doctor.py'])
@@ -788,7 +792,7 @@ def test_v11_bad_manifest_leaves_added_closure_intact(tmp_path,monkeypatch):
     import json,base64
     d,record=_v11_pending_fixture(tmp_path,monkeypatch)
     old=json.loads(base64.b64decode(record['previous_manifest']))
-    for name in ('plugin_env.py','refetch_fingerprint.py','devin_hooks.py'):
+    for name in ('plugin_env.py','refetch_fingerprint.py','devin_hooks.py','_tomli.py'):
         key=str(d.state.data_dir()/'plugin'/name);del old['files'][key];del record['previous'][key]
     d.manifest_path().write_text(json.dumps(old))
     record['previous_manifest']='!!!'
@@ -879,9 +883,9 @@ def test_v13_plain_startup_os_shadow_characterizes_unsupported_path(tmp_path,mon
     poison=tmp_path/'poison';poison.mkdir();marker=tmp_path/'os-executed'
     (poison/'os.py').write_text('open('+repr(str(marker))+',"w").write("executed")\nraise RuntimeError("os startup shadow")\n')
     run=subprocess.run([sys.executable,str(d.state.data_dir()/'plugin'/entry),'--help'],env=dict(os.environ,PYTHONPATH=str(poison)),capture_output=True,timeout=20)
-    # CPython 3.10 loads os during site startup before any script can re-exec.
-    # Newer frozen-os builds differ; neither behavior makes plain use supported.
-    if sys.version_info[:2]==(3,10):
+    # CPython 3.9 and 3.10 load os from sys.path during site startup, before any
+    # script can re-exec. 3.11+ freezes os; neither behavior makes plain use supported.
+    if sys.version_info[:2]<(3,11):
         assert marker.exists() and run.returncode!=0
         assert b'Failed to import the site module' in run.stderr
     else:
@@ -909,7 +913,7 @@ def test_v13_supported_examples_require_startup_isolation():
         content='\n'.join(visible)
         # Invocation advice is closed by class, not a growing modal-word list.
         neutral = {
-            '`prepare`, `seal` and `recover` use their required source commitments and capture/consent checks, but do not verify the entire compression closure; filtering and doctor readiness do.',
+            '`prepare`, `seal` and `recover` use their required source commitments and capture/consent checks, but stop short of verifying the entire compression closure; filtering and doctor readiness verify it.',
             'Run the installed filter explicitly:',  # Followed by a checked -I code example.
         }
         verb = r'\b(?:run|running|runs|invoke|invoked|invoking|invokes|launch|launched|launching|launches|execute|executed|executing|executes|call|called|calling|use|used|using|uses|start|started|starting|starts)\b'

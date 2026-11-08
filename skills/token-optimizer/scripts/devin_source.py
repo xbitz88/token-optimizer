@@ -11,21 +11,23 @@ import sys
 PAYLOAD = ('devin_compress.py', 'devin_state.py', 'devin_doctor.py', 'devin_verify.py', 'devin_source.py',
            'bash_compress.py', 'bash_whitelist.py', 'credential_patterns.py',
            'token_estimate.py', 'command_filters.py', 'runtime_env.py', 'py_trust.py', 'plugin_env.py', 'refetch_fingerprint.py',
-           'devin_hooks.py')
+           '_tomli.py', 'devin_hooks.py')
 ALLOWED_MODULES = frozenset(Path(name).stem for name in PAYLOAD)
 
 # Repo names outside the installed closure must never fall back to sys.path.
 REPO_MODULES = frozenset((
-    'activity_tracker', 'antigravity_doctor', 'antigravity_hook_bridge', 'antigravity_install',
+    '_measure', '_tomli',
+    'activity_tracker', 'adapter_hook_command', 'antigravity_doctor', 'antigravity_hook_bridge', 'antigravity_install',
     'antigravity_proto', 'antigravity_session', 'antigravity_state', 'archive_result',
     'bash_compress', 'bash_compress_hook', 'bash_hook', 'bash_whitelist', 'benchmark', 'cloud_kit',
     'build_output_compress', 'codex_command_compress', 'codex_compact_prompt', 'codex_doctor',
-    'codex_hook_bridge', 'codex_install', 'codex_io', 'codex_log_index', 'codex_models',
+    'codex_hook_bridge', 'codex_hook_provenance', 'codex_install', 'codex_io', 'codex_log_index', 'codex_models',
     'codex_session', 'codex_state', 'codex_statusline', 'command_filters',
     'compression_backfill', 'compression_log', 'context_intel', 'context_pressure',
     'copilot_doctor', 'copilot_hook_bridge', 'copilot_install', 'copilot_session',
     'copilot_state', 'copilot_vscode', 'cowork_doctor', 'cowork_install',
-    'credential_patterns', 'cursor_doctor', 'cursor_hook_bridge', 'cursor_install',
+    'credential_patterns', 'heal_report', 'hook_heal', 'hook_provenance', 'owned_hooks',
+    'shipped_hook_templates', 'shipped_starter_hooks', 'cursor_doctor', 'cursor_hook_bridge', 'cursor_install',
     'cursor_session', 'cursor_state', 'delta_diff', 'detectors', 'deterministic_candidates',
     'devin_compress', 'devin_doctor', 'devin_hooks', 'devin_install', 'devin_source', 'devin_state',
     'devin_verify', 'grok_doctor', 'grok_hook_bridge', 'grok_install', 'grok_session',
@@ -33,8 +35,8 @@ REPO_MODULES = frozenset((
     'hermes_state', 'hermes_tool_hooks', 'hook_io', 'hook_runtime', 'injection', 'install_reconcile', 'measure',
     'outline', 'pipeline_analyzer', 'plugin_env', 'py_trust', 'quality_cache_gate',
     'read_cache', 'recovery_output', 'refetch_fingerprint', 'refetch_guard', 'routing_advisor',
-    'runtime_env', 'session_store', 'spawn_utils', 'structure_map', 'structure_map_ts',
-    'structure_replay', 'thrash_guard', 'token_estimate', 'tool_search_diagnostic', 'utf8_io',
+    'reset_epoch', 'runtime_env', 'session_activity', 'session_store', 'spawn_utils', 'structure_map', 'structure_map_ts',
+    'structure_replay', 'thrash_guard', 'token_estimate', 'tool_search_diagnostic', 'utf8_io', 'archive_window', 'checkpoint_state',
 ))
 
 class SourceOnly(importlib.abc.MetaPathFinder, importlib.abc.Loader):

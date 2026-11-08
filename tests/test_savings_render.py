@@ -96,6 +96,19 @@ def test_transformation_percentage_matches_dollars_and_method_is_folded():
     assert len(re.sub('<[^>]+>', ' ', visible).split()) < 85
 
 
+def test_neutral_reprice_basis_is_disclosed_on_the_card():
+    s = fixture()
+    s['before_after']['compression_reprice_basis'] = 'routing_pending'
+    card = render(s).split('savings-transformation')[1].split('savings-actions')[0]
+    assert 'model-mix repricing is paused' in card.lower()
+    s['before_after']['compression_reprice_basis'] = 'routing_unavailable'
+    card = render(s).split('savings-transformation')[1].split('savings-actions')[0]
+    assert 'model-mix repricing could not be measured' in card.lower()
+    s['before_after']['compression_reprice_basis'] = 'routing_recipe'
+    card = render(s).split('savings-transformation')[1].split('savings-actions')[0]
+    assert 'model-mix repricing' not in card.lower()
+
+
 def test_capped_transformation_percentage_matches_the_capped_dollars():
     s = fixture()
     s['before_after'].update({
@@ -133,3 +146,20 @@ def test_verbosity_estimate_is_included_once():
     actions = render(s).split('savings-actions')[1].split('savings-history')[0]
     assert '$1,187' in actions
     assert 'Other estimates <strong>~$126' in actions
+
+
+def test_repeat_read_pricing_note_shows_once_beside_its_figure():
+    # The note explains the repeat-read dollar figure, so it sits in the action
+    # savings card only, not in the plan card above it.
+    source = TEMPLATE.read_text()
+    assert "counted_pricing.reread_pricing_note" not in source
+    assert "cp.reread_pricing_note" in source
+
+
+def test_flat_transformation_shows_plain_no_change_card():
+    s = fixture()
+    s['before_after'] = {'monthly_savings_usd': 0, 'reason': 'flat', 'transformation_state': 'flat',
+                         'actual_monthly_usd': 27767.09, 'counterfactual_monthly_usd': 27820.04}
+    html = render(s)
+    assert 'No measurable change in cost per unit of work' in html
+    assert 'disagree' not in html.lower()

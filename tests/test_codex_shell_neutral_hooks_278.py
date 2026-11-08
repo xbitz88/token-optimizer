@@ -6,6 +6,7 @@ Codex runs a command hook through the session shell (``powershell -NoProfile
 so under PowerShell every hook exited 1 before Token Optimizer started. The
 Stop hook also lost the session identity on its way to the deferred worker.
 """
+from helpers.measure_split import exec_source_module as _split_exec_module
 
 import importlib.util
 import json
@@ -21,6 +22,8 @@ REPO = Path(__file__).resolve().parent.parent
 SCRIPTS = REPO / "skills" / "token-optimizer" / "scripts"
 LAUNCHER_SOURCE = REPO / "hooks" / "windows-launcher.py"
 sys.path.insert(0, str(SCRIPTS))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _codex_record import record_codex  # noqa: E402
 
 
 def _load(monkeypatch, platform="win32"):
@@ -28,7 +31,7 @@ def _load(monkeypatch, platform="win32"):
     spec = importlib.util.spec_from_file_location(
         "codex_install_278", SCRIPTS / "codex_install.py")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    _split_exec_module(module)
     monkeypatch.setattr(module.sys, "platform", platform)
     return module
 
@@ -199,6 +202,8 @@ def test_neutralize_refuses_spaced_interpreter_and_foreign(monkeypatch):
     assert ci.neutralize_launcher_command("") is None
 
 
+
+
 def test_heal_converts_ours_and_leaves_foreign_alone(monkeypatch, tmp_path):
     ci = _load(monkeypatch)
     m = ci._LAUNCHER_MARKER
@@ -209,6 +214,7 @@ def test_heal_converts_ours_and_leaves_foreign_alone(monkeypatch, tmp_path):
     foreign = r'"C:\tools\python.exe" "C:\tools\my_hook.py"'
     path = tmp_path / "hooks.json"
     _write_hooks(path, [ours, foreign])
+    record_codex(ci, path, None, ours)
     assert ci.heal_quoted_launcher_commands([path]) == 1
     data = json.loads(path.read_text(encoding="utf-8"))["hooks"]
     fixed = data["E0"][0]["hooks"][0]["command"]
@@ -244,6 +250,7 @@ def test_heal_refreshes_a_stale_launcher_so_quiet_hooks_stay_quiet(monkeypatch, 
              rf'-- "hooks/run.py" "{m}" >NUL 2>&1')
     path = tmp_path / "hooks.json"
     _write_hooks(path, [quiet])
+    record_codex(ci, path, None, quiet)
     assert ci.heal_quoted_launcher_commands([path]) == 1
     assert launcher.read_bytes() == LAUNCHER_SOURCE.read_bytes()
     healed = json.loads(path.read_text(encoding="utf-8"))["hooks"]["E0"][0]["hooks"][0]["command"]
@@ -388,6 +395,8 @@ def test_doctor_flags_cmd_only_commands(monkeypatch, tmp_path):
     old = (r'set "TOKEN_OPTIMIZER_RUNTIME=codex" && "C:\P\python.exe" "C:\u\w.py" '
            rf'--baked-root "C:\u\5.1.1" -- "hooks/stop_runner.py" "{m}"')
     new = (rf'C:\P\python.exe "C:\u\w.py" --baked-root "C:\u\5.1.1" -- "hooks/stop_runner.py" "{m}"')
+    record_codex(ci, tmp_path / "hooks.json", {"hooks": {"Stop": [
+        {"hooks": [{"type": "command", "command": old}, {"type": "command", "command": new}]}]}}, old, new)
     (tmp_path / "hooks.json").write_text(json.dumps({"hooks": {"Stop": [
         {"hooks": [{"type": "command", "command": old}]}]}}), encoding="utf-8")
     checks = codex_doctor._hook_shell_check()
@@ -413,6 +422,9 @@ def test_doctor_flags_generated_dev_checkout_command(monkeypatch, tmp_path):
     command = ci._hook_command("stop_runner.py")
     assert ci.is_shell_neutral_command(command), command
     assert "windows-launcher.py" in command and "&&" not in command
+    old = r'set "TOKEN_OPTIMIZER_RUNTIME=codex" && C:\Python315\python.exe C:\dev\token-optimizer\hooks\run.py stop_runner.py'
+    record_codex(ci, tmp_path / "hooks.json", {"hooks": {"Stop": [
+        {"hooks": [{"type": "command", "command": command}, {"type": "command", "command": old}]}]}}, command, old)
     (tmp_path / "hooks.json").write_text(json.dumps({"hooks": {"Stop": [
         {"hooks": [{"type": "command", "command": command}]}]}}), encoding="utf-8")
     assert [c["status"] for c in codex_doctor._hook_shell_check()] == ["OK"]
@@ -444,7 +456,7 @@ def _stop_runner(monkeypatch, tmp_path):
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
     spec = importlib.util.spec_from_file_location("stop_runner_278", REPO / "hooks" / "stop_runner.py")
     mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    _split_exec_module(mod)
     return mod
 
 
@@ -535,9 +547,12 @@ def test_reinstall_replaces_the_old_command_without_duplicating(monkeypatch, tmp
     monkeypatch.setattr(ci, "_repo_root", lambda: root)
     old = ci._cmd_only_launcher_command(root, "hooks/stop_runner.py", [], {}, silent=True)
     existing = {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": old, "timeout": 15}]}]}}
-    merged = ci._merge_hooks(existing)
+    record_codex(ci, tmp_path / "hooks.json", existing, old)
+    proof = ci._codex_proof(tmp_path / "hooks.json")
+    merged = ci._merge_hooks(existing, proof=proof)
     stops = merged["hooks"]["Stop"]
-    ours = [g for g in stops if ci._is_token_optimizer_group(g)]
+    assert len(stops) == 1  # replaced, not duplicated
+    ours = [g for g in stops if ci._is_token_optimizer_group("Stop", g, proof)]
     assert len(ours) == 1
     cmd = ours[0]["hooks"][0]["command"]
     assert ci.is_shell_neutral_command(cmd) and "&&" not in cmd
@@ -545,3 +560,39 @@ def test_reinstall_replaces_the_old_command_without_duplicating(monkeypatch, tmp
         for g in groups:
             for h in g["hooks"]:
                 assert ci.is_shell_neutral_command(h["command"]), h["command"]
+
+
+# ---- interpreter paths holding "@" (Homebrew's python@3.14) ----------------
+
+HOMEBREW_PYTHON = "/opt/homebrew/opt/python@3.14/bin/python3.14"
+
+
+@pytest.mark.parametrize("exe", [
+    HOMEBREW_PYTHON,
+    "C:\\Users\\jo@example\\AppData\\Local\\Programs\\Python\\Python314\\python.exe",
+])
+def test_interpreter_path_with_at_sign_stays_shell_neutral(monkeypatch, tmp_path, exe):
+    ci = _load(monkeypatch)
+    monkeypatch.setattr(ci.sys, "executable", exe)
+    root = _fake_install(tmp_path)
+    monkeypatch.setattr(ci, "_repo_root", lambda: root)
+    cmd = ci._hook_command("hooks/stop_runner.py", redirect_quiet=True)
+    assert ci.is_shell_neutral_command(cmd), cmd
+    assert cmd.startswith(exe + " ")
+    assert not cmd.startswith(ci._WIN_UNQUOTED_PREFIX)
+
+
+def test_at_sign_never_leads_a_bare_interpreter_token(monkeypatch):
+    ci = _load(monkeypatch)
+    assert ci._shell_neutral_exe("@python.exe") is None
+
+
+def test_homebrew_python_on_macos_gets_a_posix_hook_not_a_windows_one(monkeypatch, tmp_path):
+    ci = _load(monkeypatch, platform="darwin")
+    monkeypatch.setattr(ci.sys, "executable", HOMEBREW_PYTHON)
+    root = _fake_install(tmp_path)
+    monkeypatch.setattr(ci, "_repo_root", lambda: root)
+    cmd = ci._hook_command("hooks/stop_runner.py", redirect_quiet=True)
+    assert "python-launcher.sh" in cmd and 'exec "$b"' in cmd
+    for windows_only in (ci._WIN_UNQUOTED_PREFIX, ">NUL", "windows-launcher"):
+        assert windows_only not in cmd

@@ -17,6 +17,7 @@ can't go red on the addback is not a gate -- both branches are asserted.
 """
 
 from __future__ import annotations
+from helpers.measure_split import exec_source_module as _split_exec_module
 
 import importlib.util
 import sys
@@ -40,7 +41,7 @@ def measure(tmp_path, monkeypatch):
     spec = importlib.util.spec_from_file_location("measure", SCRIPTS / "measure.py")
     mod = importlib.util.module_from_spec(spec)
     sys.modules["measure"] = mod
-    spec.loader.exec_module(mod)
+    _split_exec_module(mod)
     yield mod
     sys.modules.pop("measure", None)
 
@@ -58,7 +59,7 @@ def _wire(measure, monkeypatch, resume_lean_usd):
     monkeypatch.setattr(measure, "_dashboard_spent_token_basis",
                         lambda conn, days=30: {"tokens": 1_000_000,
                                                "basis": "test", "complete": True})
-    monkeypatch.setattr(measure, "_input_rate_mix_ratio", lambda days=30: 1.5)
+    monkeypatch.setattr(measure, "_runway_routing_lever", lambda days=30: {"state": "estimated", "factor": 1.5})
 
     rl = {"cost_saved_usd": resume_lean_usd, "tokens_saved": 1, "events": 9} \
         if resume_lean_usd else None

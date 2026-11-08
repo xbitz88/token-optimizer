@@ -1,6 +1,6 @@
 # Token Optimizer for Hermes
 
-**Beta (v0.2.1).** The Token Optimizer feature set for [NousResearch Hermes](https://github.com/NousResearch/hermes-agent): smaller terminal and tool output, cheaper re-reads, loop warnings, checkpoints that survive compaction, prior-session hints, cost and quality tracking, and the shared dashboard.
+**Beta (v0.2.2).** The Token Optimizer feature set for [NousResearch Hermes](https://github.com/NousResearch/hermes-agent): smaller terminal and tool output, cheaper re-reads, loop warnings, checkpoints that survive compaction, prior-session hints, cost and quality tracking, and the shared dashboard.
 
 Native Python plugin. Reads Hermes's own `~/.hermes/state.db` read-only. Model-agnostic. No telemetry, no network calls, no Python dependencies.
 
@@ -152,7 +152,7 @@ Model-agnostic: Hermes routes to Nous Portal, OpenRouter, Anthropic, OpenAI, Gem
 - A working Hermes install
 - The Token Optimizer repo cloned locally (the plugin runs its engines from there)
 
-**Beta status:** fully tested against Hermes's documented hook contract (upstream commit `7ee6d99c`), not yet validated against a live Hermes install. File issues on the [Token Optimizer repo](https://github.com/alexgreensh/token-optimizer).
+**Beta status:** fully tested against Hermes's documented hook contract (upstream commit `7ee6d99c`); fixes reported from live installs shipped in Token Optimizer 5.13.60 and 5.13.63. File issues on the [Token Optimizer repo](https://github.com/alexgreensh/token-optimizer).
 
 ## How It Works
 

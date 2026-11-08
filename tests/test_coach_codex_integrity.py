@@ -391,3 +391,178 @@ def test_claude_coach_text_preserved(monkeypatch):
     assert 'Sonnet' in patterns['High Cost Per Session']['fix']
     assert '/model' in patterns['Frequent Model Switching']['fix']
     assert '/model' in patterns['Cache Hit Rate Dropping (Model Switches)']['fix']
+
+
+def test_codex_config_reads_full_toml_on_supported_python(monkeypatch, tmp_path):
+    """Python 3.9/3.10 must not silently discard real Codex configuration."""
+    monkeypatch.setattr(measure, "RUNTIME_DIR", tmp_path)
+    monkeypatch.setattr(measure, "_codex_config_cache", None)
+    (tmp_path / "config.toml").write_text('''
+model = "gpt-5.4"
+model_context_window = 1_000_000
+tool_output_token_limit = 8_192
+notes = """first line
+[not.a.table]
+last line"""
+when = 2026-11-06T12:00:00Z
+[mcp_servers."service.with.dots"]
+command = 'example-server'
+args = ["--one", "--two",]
+env = { MODE = "test", "key.with.dots" = "yes" }
+[[skills.config]]
+path = '/tmp/a skill/SKILL.md'
+enabled = false
+''', encoding="utf-8")
+    config = measure._read_codex_config()
+    assert config["model"] == "gpt-5.4"
+    assert config["model_context_window"] == 1_000_000
+    assert config["tool_output_token_limit"] == 8192
+    assert "[not.a.table]" in config["notes"]
+    assert config["when"].isoformat() == "2026-11-06T12:00:00+00:00"
+    assert config["mcp_servers"]["service.with.dots"]["env"]["key.with.dots"] == "yes"
+    assert config["skills"]["config"][0]["enabled"] is False
+    assert measure._read_codex_config() is config
+    assert measure._codex_config_model() == "gpt-5.4"
+    assert measure._codex_config_int("model_context_window") == 1_000_000
+    assert measure._codex_config_int("tool_output_token_limit") == 8192
+
+
+def test_codex_config_invalid_or_missing_still_fails_open(monkeypatch, tmp_path):
+    monkeypatch.setattr(measure, "RUNTIME_DIR", tmp_path)
+    monkeypatch.setattr(measure, "_codex_config_cache", None)
+    assert measure._read_codex_config() == {}
+    (tmp_path / "config.toml").write_text('model = "one"\nmodel = "two"\n', encoding="utf-8")
+    assert measure._read_codex_config() == {}
+
+
+@pytest.mark.parametrize("text", [
+    'x=1_000\ny=0xff\nz=0o755\nw=0b1010\n',
+    'x=1.2e3\ny=-0.0\n',
+    '"a.b" = "v"\na.b.c = 4\n',
+    '[[products]]\nname="one"\n[[products]]\nname="two"\n',
+    "x='''literal\n[a]\nend'''\n",
+    'x = [[1,2], [3,4], ]\ny={a="b",c=[1,2]}\n',
+    'x=1979-05-27T07:32:00Z\ny=1979-05-27\nz=07:32:00\n',
+    'x="\\u03B4 \\U0001F600"\n',
+    '[a]\n[a.b]\nx=true\n',
+])
+def test_bundled_toml_reader_matches_runtime_parser(text):
+    from _measure._vendor import tomli
+    assert tomli.loads(text) == measure.tomllib.loads(text)
+
+
+@pytest.mark.parametrize("text", [
+    'x=1\nx=2', 'x=01', 'x=[1,', '[a]\n[a]',
+    'x="\\q"', 'x={a=1,a=2}', 'x = "\x00"',
+])
+def test_bundled_toml_reader_rejects_invalid_documents(text):
+    from _measure._vendor import tomli
+    with pytest.raises(tomli.TOMLDecodeError):
+        tomli.loads(text)
+
+
+_LAZY_TOMLI_PROBE = r'''
+import sys, importlib.abc
+class _NoStdlibToml(importlib.abc.MetaPathFinder):
+    def find_spec(self, name, path=None, target=None):
+        if name == "tomllib":
+            raise ImportError("simulated Python 3.9/3.10")
+sys.meta_path.insert(0, _NoStdlibToml())
+sys.path.insert(0, sys.argv[1])
+import measure
+parser = "_tomli"
+before = parser in sys.modules
+data = measure.tomllib.loads("a = 1\n[b]\nc = [1.5]\n")
+after = parser in sys.modules
+from _measure._vendor import tomli
+print(before, after, data == {"a": 1, "b": {"c": [1.5]}}, tomli is measure.tomllib,
+      issubclass(measure.tomllib.TOMLDecodeError, ValueError))
+'''
+
+
+def test_vendored_tomli_package_is_a_shim_over_flat_module():
+    """_measure._vendor.tomli re-exports _tomli; no second parser copy may return."""
+    import importlib
+    import _tomli
+    from _measure._vendor import tomli
+    assert tomli.loads is _tomli.loads
+    assert tomli.load is _tomli.load
+    assert tomli.TOMLDecodeError is _tomli.TOMLDecodeError
+    with pytest.raises(ImportError):
+        importlib.import_module("_measure._vendor.tomli._parser")
+
+
+def test_vendored_tomli_fallback_runs_only_on_first_parse(tmp_path):
+    """3.9/3.10 facade import must not execute Tomli; the first parse does."""
+    import os
+    import subprocess
+    env = dict(os.environ, HOME=str(tmp_path), USERPROFILE=str(tmp_path))
+    out = subprocess.run(
+        [sys.executable, "-c", _LAZY_TOMLI_PROBE, str(SCRIPTS)],
+        capture_output=True, text=True, env=env, cwd=str(tmp_path), timeout=120,
+    )
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.split() == ["False", "True", "True", "True", "True"], out.stdout
+
+
+_LAZY_TOMLI_THREADS_PROBE = r'''
+import sys, threading, importlib.abc
+class _NoStdlibToml(importlib.abc.MetaPathFinder):
+    def find_spec(self, name, path=None, target=None):
+        if name == "tomllib":
+            raise ImportError("simulated Python 3.9/3.10")
+sys.meta_path.insert(0, _NoStdlibToml())
+sys.path.insert(0, sys.argv[1])
+import measure
+barrier = threading.Barrier(8)
+errors = []
+def worker():
+    try:
+        barrier.wait(timeout=10)
+        for _ in range(10):
+            assert measure.tomllib.loads("a = 1\n[b]\nc = [1.5]\n") == {"a": 1, "b": {"c": [1.5]}}
+    except Exception as exc:
+        errors.append(repr(exc))
+threads = [threading.Thread(target=worker) for _ in range(8)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+print("errors", len(errors), errors[:1])
+'''
+
+
+def test_vendored_tomli_first_parse_is_thread_safe(tmp_path):
+    """Concurrent first parses must not observe a half-loaded lazy module.
+
+    Python 3.9/3.10's importlib LazyLoader is lock-free; eight threads racing
+    the first attribute access used to raise AttributeError on the lazy
+    module. The locked lazy loader must serialize the first exec instead.
+    """
+    import os
+    import subprocess
+    env = dict(os.environ, HOME=str(tmp_path), USERPROFILE=str(tmp_path))
+    out = subprocess.run(
+        [sys.executable, "-c", _LAZY_TOMLI_THREADS_PROBE, str(SCRIPTS)],
+        capture_output=True, text=True, env=env, cwd=str(tmp_path), timeout=120,
+    )
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.split()[:2] == ["errors", "0"], out.stdout
+
+
+def test_vendored_tomli_reentrant_loads_during_parser_exec_raises(monkeypatch):
+    """A resolver captured while _tomli is mid-exec must fail loudly, not return None.
+
+    ``tomli.loads()`` invoked re-entrantly during ``_tomli``'s own first import
+    used to hand back ``None`` (the partial module has no ``loads`` yet). It
+    must raise instead of silently producing a wrong result.
+    """
+    import types
+    from _measure._vendor import tomli
+    tomli._EXPORTS  # exec the shim without importing _tomli
+    partial = types.ModuleType("_tomli")  # stands in for the still-executing parser
+    monkeypatch.setitem(sys.modules, "_tomli", partial)
+    resolver = tomli.__dict__["__getattr__"]("loads")
+    assert callable(resolver)
+    with pytest.raises(RuntimeError, match="_tomli is still executing"):
+        resolver("a = 1")

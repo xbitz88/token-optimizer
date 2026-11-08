@@ -37,7 +37,9 @@ def _load(tmp_path, monkeypatch):
     # monkeypatch restores the original module objects afterwards, so later
     # tests that hold a reference to runtime_env keep patching the live one.
     for name in ("measure", "runtime_env", "plugin_env"):
-        monkeypatch.delitem(sys.modules, name, raising=False)
+        # setitem first so teardown also removes a module that was absent here.
+        monkeypatch.setitem(sys.modules, name, sys.modules.get(name))
+        monkeypatch.delitem(sys.modules, name)
     monkeypatch.syspath_prepend(str(SCRIPTS))
     return importlib.import_module("measure")
 
@@ -137,6 +139,9 @@ def test_subagent_spend_is_in_the_daily_cost(tmp_path, monkeypatch):
     assert day["total_cost_usd"] == pytest.approx(expected, abs=1e-4)
 
 
+    entry = measure.session_cost_query(["--id", SID])["sessions"][0]
+    assert entry["cost_usd"]["total"] == pytest.approx(expected, abs=1e-4)
+
 def test_request_written_to_parent_and_subagent_bills_once(tmp_path, monkeypatch):
     """Claude Code can write one API request into several of a session's files."""
     measure = _load(tmp_path, monkeypatch)
@@ -158,8 +163,8 @@ def test_request_written_to_parent_and_subagent_bills_once(tmp_path, monkeypatch
     assert (inp, out) == (2000, 3500)
 
 
-def test_undated_request_bills_to_the_session_date(tmp_path, monkeypatch):
-    """A request with no usable timestamp is still spend; it bills to the session's date."""
+def test_undated_request_retains_lifetime_cost_without_a_window_date(tmp_path, monkeypatch):
+    """Undated spend remains in lifetime pricing and is not fabricated into a day."""
     measure = _load(tmp_path, monkeypatch)
     when = _noon(0)
     parent = tmp_path / "claude_home" / "projects" / "-repo" / f"{SID}.jsonl"
@@ -172,14 +177,17 @@ def test_undated_request_bills_to_the_session_date(tmp_path, monkeypatch):
     measure.collect_sessions(days=30, quiet=True)
     day = _daily(measure)[datetime.now().strftime("%Y-%m-%d")]
 
-    expected = (_cost(measure, "claude-opus-4-8") + _cost(measure, "claude-opus-4-8", out=2000)
+    expected = (_cost(measure, "claude-opus-4-8")
                 + _cost(measure, "claude-opus-4-8", inp=90_000, out=9000))
     assert day["total_cost_usd"] == pytest.approx(expected, abs=1e-4)
 
 
-def test_undated_request_bills_to_the_last_real_day_not_the_file_mtime(tmp_path, monkeypatch):
-    """File mtime can be a day the session never ran; untimestamped spend follows
-    the requests, and does not make a one-day session look multi-day."""
+    entry = measure.session_cost_query(["--id", SID])["sessions"][0]
+    assert entry["cost_usd"]["total"] == pytest.approx(expected + _cost(measure, "claude-opus-4-8", out=2000), abs=1e-4)
+    assert entry["activity_complete"] is False
+
+def test_undated_request_is_excluded_from_both_activity_and_mtime_days(tmp_path, monkeypatch):
+    """Only timestamped usage belongs to a day; lifetime cost still includes both."""
     measure = _load(tmp_path, monkeypatch)
     when = _noon(2)
     parent = tmp_path / "claude_home" / "projects" / "-repo" / f"{SID}.jsonl"
@@ -193,9 +201,13 @@ def test_undated_request_bills_to_the_last_real_day_not_the_file_mtime(tmp_path,
     assert _noon(1).strftime("%Y-%m-%d") not in daily
     day = daily[when.strftime("%Y-%m-%d")]
     assert day["total_cost_usd"] == pytest.approx(
-        _cost(measure, "claude-opus-4-8") + _cost(measure, "claude-opus-4-8", out=2000), abs=1e-4)
+        _cost(measure, "claude-opus-4-8"), abs=1e-4)
     assert [sd["continuation"] for sd in day["session_details"]] == [False]
 
+
+    entry = measure.session_cost_query(["--id", SID])["sessions"][0]
+    assert entry["cost_usd"]["total"] == pytest.approx(_cost(measure, "claude-opus-4-8") + _cost(measure, "claude-opus-4-8", out=2000), abs=1e-4)
+    assert entry["activity_complete"] is False
 
 def test_resumed_session_moves_to_its_latest_day(tmp_path, monkeypatch):
     measure = _load(tmp_path, monkeypatch)

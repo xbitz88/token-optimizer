@@ -8,6 +8,7 @@ compact window, and the plugin skill count across cached versions.
 """
 
 from __future__ import annotations
+from helpers.measure_split import exec_source_module as _split_exec_module
 
 import importlib.util
 import json
@@ -19,12 +20,17 @@ import pytest
 REPO = Path(__file__).resolve().parent.parent
 SCRIPTS = REPO / "skills" / "token-optimizer" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _codex_record import record_codex  # noqa: E402
 
 import codex_compact_prompt as ccp  # noqa: E402
 import codex_doctor  # noqa: E402
 import codex_install  # noqa: E402
 
-tomllib = pytest.importorskip("tomllib")
+try:
+    import tomllib
+except ImportError:
+    from _measure._vendor import tomli as tomllib
 
 PROMPT = Path("/home/u/.codex/token-optimizer/codex-compact-prompt.md")
 WIN_PROMPT = r"C:\Users\u\.codex\token-optimizer\codex-compact-prompt.md"
@@ -99,6 +105,15 @@ def test_array_line_that_looks_like_a_header_is_not_used():
     assert tomllib.loads(updated)["paths"] == [["a"]]
 
 
+
+def test_multiline_string_header_is_not_used_for_compact_prompt():
+    text = 'notes = """first\n[not_a_table]\nlast"""\n\n[tui]\ntheme = "dark"\n'
+    updated, _ = ccp._replace_or_append_config(text, PROMPT, force=False)
+    parsed = tomllib.loads(updated)
+    assert parsed["experimental_compact_prompt_file"] == str(PROMPT)
+    assert parsed["notes"] == "first\n[not_a_table]\nlast"
+
+
 def test_status_decodes_escaped_windows_path():
     # TOML stores backslashes escaped, so the raw path never appears verbatim.
     block = ccp._managed_block(Path(WIN_PROMPT)) if sys.platform == "win32" else (
@@ -133,7 +148,7 @@ def test_posix_runner_hooks_are_replaced_not_duplicated(monkeypatch, root):
 
 def test_foreign_runner_named_hook_outside_our_folder_is_kept(monkeypatch):
     foreign = {"hooks": [{"type": "command", "command": "python3 /opt/tools/hooks/stop_runner.py"}]}
-    assert not codex_install._is_token_optimizer_group(foreign)
+    assert not codex_install._is_token_optimizer_group("Stop", foreign)
 
 
 # --- doctor -------------------------------------------------------------------
@@ -198,7 +213,7 @@ def measure(tmp_path, monkeypatch):
     spec = importlib.util.spec_from_file_location("measure", SCRIPTS / "measure.py")
     mod = importlib.util.module_from_spec(spec)
     sys.modules["measure"] = mod
-    spec.loader.exec_module(mod)
+    _split_exec_module(mod)
     try:
         yield mod
     finally:
@@ -300,6 +315,8 @@ def test_status_without_a_toml_parser(monkeypatch):
     assert ccp.configured_prompt_state("[tui]\nx = 1\n\n" + block, WIN_PROMPT) == "misplaced"
 
 
+
+
 def test_heal_repairs_only_our_quoted_launcher_commands(tmp_path):
     marker = codex_install._LAUNCHER_MARKER
     # Heal refreshes the launcher the command names before rewriting it, so
@@ -316,9 +333,13 @@ def test_heal_repairs_only_our_quoted_launcher_commands(tmp_path):
     }}
     path = tmp_path / "hooks.json"
     path.write_text(json.dumps(hooks), encoding="utf-8")
+    # Unproven bytes are never rewritten, whatever they look like.
+    assert codex_install.heal_quoted_launcher_commands([path]) == 0
+    record_codex(codex_install, path, hooks, ours)
     assert codex_install.heal_quoted_launcher_commands([path]) == 1
     data = json.loads(path.read_text(encoding="utf-8"))
     fixed = data["hooks"]["Stop"][0]["hooks"][0]["command"]
+    assert codex_install._codex_proof(path).owns(("Stop", "", "command", fixed))  # the rewrite is recorded
     # Issue #278: the exact generated shape is rewritten to the shell-neutral
     # form (PowerShell and cmd.exe both run it), not the cmd-only set prefix.
     assert fixed == codex_install.neutralize_launcher_command(ours)
@@ -341,6 +362,7 @@ def test_heal_falls_back_to_unquoted_set_prefix_when_no_neutral_form(tmp_path, m
     path.write_text(json.dumps({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": ours}]}]}}),
                     encoding="utf-8")
     assert codex_install.neutralize_launcher_command(ours) is None
+    record_codex(codex_install, path, None, ours)
     assert codex_install.heal_quoted_launcher_commands([path]) == 1
     fixed = json.loads(path.read_text(encoding="utf-8"))["hooks"]["Stop"][0]["hooks"][0]["command"]
     assert fixed == f"{codex_install._WIN_UNQUOTED_PREFIX} {ours}"

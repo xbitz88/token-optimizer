@@ -11,6 +11,13 @@ export interface SavingsEventsSummary {
     totalTokensSaved: number;
     totalCostSavedUsd: number;
     totalCount: number;
+    unpricedTokens?: number;
+    unpricedEvents?: number;
+    archivePricedNetUsd?: number | null;
+    /** Priced tokens/dollars that used the input rate because no billed class was
+     * recorded — an honest floor, disclosed wherever these savings are shown. */
+    inputRateFloorTokens?: number;
+    inputRateFloorUsd?: number;
 }
 /**
  * Optional lookback window for savings-events reads. Mirrors Python
@@ -30,11 +37,37 @@ export interface SavingsEventsWindow {
  * is given, only events whose `timestamp` is within `now - days` are counted.
  */
 export declare function readSavingsEventsByCategory(openclawDir?: string, window?: SavingsEventsWindow): SavingsEventsSummary;
+export declare function measuredSavingsFromSummary(summary: SavingsEventsSummary): number;
+/**
+ * Counterfactual event credits over the window, grouped by type:
+ * checkpoint_restore (working-set re-reads a restore skipped), resume_lean
+ * (cold-resume rewrite avoided) and hint_followed (searches a followed hint
+ * replaced). Triggers are observed; magnitudes are inferred -- mirrors
+ * measure.py's estimated_volume_pools. The caller reprices to the baseline
+ * INPUT rate and adds them as a separate estimated pool, never inside the
+ * measured total.
+ */
+export declare function estimatedCounterfactualUsd(openclawDir: string, window: SavingsEventsWindow): {
+    total: number;
+    byType: Record<string, number>;
+};
 export interface SavingsBreakdownItem {
     key: string;
     label: string;
+    /** Exact raw lever value. */
     monthlyUsd: number;
+    /** Cent-allocated display value: the displayed levers always add to the
+     * displayed headline (largest-remainder cent allocation, round once). */
+    monthlyUsdDisplay: number;
 }
+/**
+ * Largest-remainder cent allocation. Rounds `total` to cents once, then
+ * apportions those cents across `parts` so the returned parts always re-add to
+ * the rounded total. Signed parts are handled by flooring toward -inf before
+ * apportioning; `parts` need not already sum to `total` (any remainder surplus
+ * lands on the first part so the sum always holds).
+ */
+export declare function allocateCents(total: number, parts: number[]): number[];
 /** Structured baseline-building progress (mirrors measure.py `_baseline_progress`). */
 export interface BaselineBuildingProgress {
     sessionsInWindow: number;
@@ -85,9 +118,29 @@ export interface RealizedSavings {
     verbosityMeasuredUsd: number;
     /** Repriced verbosity-steer $ (estimated output reduction at baseline mix). */
     verbosityTransformationUsd: number;
+    /** Repriced counterfactual event credits $ (checkpoint_restore + resume_lean
+     * + hint_followed at the baseline input mix). Estimated tier. */
+    counterfactualEstimatedUsd: number;
     transformationPct: number;
     beforeOpus: number;
     afterOpus: number;
+    premiumTokens?: number;
+    premiumCostUsd?: number;
+    /** Recent tokens excluded because their model has no known price. */
+    unpricedTokens?: number;
+    /**
+     * Monthly gap between the exact generation-card cost of the current eligible
+     * work and its reference-card value (the price both routing arms use). It is
+     * a vendor price or generation difference, never routing, and is not part of
+     * the savings total. Negative when the exact cards are cheaper.
+     */
+    generationPriceDeltaUsd?: number;
+    /** Share of a frozen baseline's tokens whose model has no rate card; dropped from the comparison. */
+    baselineUnpricedShare?: number;
+    /** Models behind baselineUnpricedShare. */
+    baselineUnpricedModels?: string[];
+    baselineClassMixAvailable?: boolean;
+    baselineTtlMixAvailable?: boolean;
     /**
      * Structured baseline-building progress. Present when `ready === false` and the
      * not-ready reason is an insufficient early-session count or the window is still

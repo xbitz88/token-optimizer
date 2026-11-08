@@ -28,8 +28,8 @@ This module puts the REAL Token Optimizer there, not a reimplementation:
     Checks the install from inside a VM (or any machine).
 
 Rules this module keeps:
-    * stdlib only, no imports from sibling modules: install runs under
-      ``python3 -I`` straight out of the extracted tarball.
+    * stdlib only, no sibling imports (``python3 -I`` from the tarball); the one
+      exception, hook_provenance.py, is loaded by explicit path to record hooks.
     * nothing is written into any repository working tree.
     * settings are merged, never overwritten; only entries whose command runs
       our run.sh are ever replaced or removed; JSONC / duplicate keys refused.
@@ -37,12 +37,11 @@ Rules this module keeps:
       install-cloud.sh appends to install.log, and exit status 1), and the
       shell wrapper always exits 0, so a cloud session's setup never fails.
 """
-
 from __future__ import annotations
-
 import base64
 import compileall
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -53,7 +52,6 @@ import tempfile
 import urllib.parse
 import urllib.request
 from pathlib import Path
-
 PACKAGE = "@alexgreensh/token-optimizer"
 REGISTRY = "https://registry.npmjs.org"
 CACHE_DIRNAME = "token-optimizer-cloud"
@@ -61,15 +59,11 @@ RUNNER_NAME = "token-optimizer-cloud-run.sh"
 # Every hook command we write contains this (whatever the cache dir is); it is
 # how we, and measure.py's self-heal, recognize our entries and only ours.
 MARKER = "/" + RUNNER_NAME
-
 SCRIPTS_DIR = Path(__file__).resolve().parent
 PLUGIN_ROOT = SCRIPTS_DIR.parents[2]
-
 # Semver with an optional prerelease tag (5.13.50-rc.1). The charset stays
 # shell-safe because the version is rendered into the setup script.
 _VERSION_RE = re.compile(r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?$")
-
-
 def _version_key(v: str):
     """Sort key: releases after their prereleases, numeric parts numerically."""
     core, _, pre = v.partition("-")
@@ -242,32 +236,19 @@ def _is_ours(group) -> bool:
 
 
 def _without_ours(groups: list) -> list:
-    """The groups with our hook commands taken out, hook by hook. A group that
-    also holds the user's own hooks (someone added one next to ours) keeps
-    them, with its matcher and other keys; only a group left with no hooks at
-    all is dropped. Groups without any of ours are returned untouched."""
+    """Our hook commands taken out, hook by hook. A group that also holds the user's own
+    hooks keeps them and its other keys; only a group left empty is dropped; others untouched."""
     kept = []
     for group in groups:
-        if not _is_ours(group):
-            kept.append(group)
-            continue
-        rest = [h for h in group["hooks"] if not _is_our_hook(h)]
-        if rest:
-            g = dict(group)
-            g["hooks"] = rest
-            kept.append(g)
+        rest = [h for h in group["hooks"] if not _is_our_hook(h)] if _is_ours(group) else None
+        if rest is None or rest:
+            kept.append(group if rest is None else dict(group, hooks=rest))
     return kept
 
 
 def _only_ours(groups: list) -> list:
     """The inverse view, for the doctor: each group cut down to our hooks."""
-    out = []
-    for group in groups:
-        if _is_ours(group):
-            g = dict(group)
-            g["hooks"] = [h for h in group["hooks"] if _is_our_hook(h)]
-            out.append(g)
-    return out
+    return [dict(g, hooks=[h for h in g["hooks"] if _is_our_hook(h)]) for g in groups if _is_ours(g)]
 
 
 def merge_settings(settings: dict, hook_map: dict) -> dict:
@@ -356,7 +337,19 @@ def write_settings_hooks(settings_path: Path, hook_map) -> bool:
     # A file that held only our hooks is left as {} rather than deleted: we
     # cannot know whether something else created it.
     _atomic_write(settings_path, dump_settings(new, text))
+    _record_provenance(settings_path, data, new, hook_map or {})
     return True
+
+
+def _record_provenance(path: Path, before: dict, after: dict, hook_map: dict) -> None:
+    """Record the hook entries this write added (hook_provenance.py, by path)."""
+    try:
+        spec = importlib.util.spec_from_file_location("hook_provenance", SCRIPTS_DIR / "hook_provenance.py")
+        hp = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(hp)
+        hp.record_cloud_write(path, before, after, hook_map)
+    except Exception:  # noqa: BLE001 - provenance never blocks an install
+        pass
 
 
 def write_managed_fallback(hook_map: dict, directory=None) -> str:
@@ -491,7 +484,13 @@ def render_run_sh(root: Path, pycache: Path, version: str) -> str:
 # extracted tarball (package.json, README, LICENSE files) is copied too; this
 # list is what must exist for a usable install.
 _REQUIRED = ("hooks/hooks.json", "hooks/python-launcher.sh", "hooks/run.py",
-             "skills/token-optimizer/scripts/measure.py")
+             "skills/token-optimizer/scripts/measure.py") + tuple(
+    "skills/token-optimizer/scripts/_measure/" + name for name in (
+        '__init__.py', '_compat.py', 'runtime.py', 'pricing.py', 'audit.py',
+        'dashboard.py', 'lifecycle.py', 'sessions.py', 'trends.py', 'cache_policy.py',
+        'daemon.py', 'quality_archive.py', 'continuity.py', 'savings.py', 'cli.py',
+    )
+)
 
 
 # Written into the cache dir on install. Uninstall only removes the shared

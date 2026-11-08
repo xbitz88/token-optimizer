@@ -34,12 +34,16 @@ from typing import Any, Optional
 from hook_io import read_stdin_hook_input
 from plugin_env import is_v5_flag_enabled, resolve_snapshot_dir
 from runtime_env import project_config_value, run_origin, runtime_home
+from reset_epoch import _reset_replacement_state, refresh_message, snapshot_reset_epoch
 
 try:
-    from session_store import SessionStore, cleanup_old_stores
+    from session_store import SessionStore, cleanup_old_stores, mark_context_reset
 except ImportError:
     SessionStore = None  # type: ignore[assignment,misc]
     cleanup_old_stores = None  # type: ignore[assignment]
+
+    def mark_context_reset(*_a, **_k):  # type: ignore[misc]
+        return None
 
 try:
     from credential_patterns import redact_credentials as _redact_creds
@@ -330,9 +334,13 @@ DEFAULT_MODE = "soft_block"
 MIN_STRUCTURE_CONFIDENCE = 0.75
 MAX_CONSECUTIVE_DENIALS = 3
 REASON_ONLY_TOKENS_EST = 10
-# U-G3: conservative avoided-search credit when a proactive hint sends the agent
-# straight to a file (~2 exploratory reads of ~2500 tokens it didn't have to do
-# to locate it). Deliberately small -- lean understated, observed-once per file.
+# U-G3: conservative avoided-search ESTIMATE credited when a proactive hint
+# sends the agent straight to a file (~2 exploratory reads of ~2500 tokens it
+# plausibly did not have to do to locate it). The hint->read trigger is
+# observed; whether a search would otherwise have run is not, so the magnitude
+# is a fixed estimate and _get_savings_summary files the event in the
+# estimated tier, never the measured total. Deliberately small -- lean
+# understated, claimed once per file.
 _HINT_FOLLOW_AVOIDED_TOKENS = 5000
 STRICT_CONTEXT_CAPS = {
     "signatures": 350,
@@ -592,16 +600,6 @@ def _decisions_log_path(session_id: str = "unknown") -> Path:
     return decisions_dir / f"{safe_id}.jsonl"
 
 
-
-def _reset_replacement_state(entry: dict[str, Any]) -> None:
-    entry["last_replacement_fingerprint"] = ""
-    entry["last_replacement_type"] = ""
-    entry["repeat_replacement_count"] = 0
-    entry["consecutive_denials"] = 0
-    entry["last_structure_reason"] = ""
-    entry["last_structure_confidence"] = 0.0
-
-
 def _check_escape_hatch(
     entry: dict[str, Any],
     store: Any,
@@ -616,6 +614,7 @@ def _check_escape_hatch(
     summary: Any,
     save_hook_context_enabled: bool,
     quiet: bool,
+    reset_epoch: Any = None,
 ) -> bool:
     """Allow the read if consecutive denials reach the threshold. Returns True if escaped."""
     consecutive_denials = int(entry.get("consecutive_denials", 0) or 0) + 1
@@ -625,7 +624,7 @@ def _check_escape_hatch(
 
     entry["consecutive_denials"] = 0
     _reset_replacement_state(entry)
-    store.upsert_file_entry(file_path, entry)
+    store.upsert_file_entry(file_path, entry, expected_reset_epoch=reset_epoch)
     _log_decision(
         "allow",
         file_path,
@@ -1123,7 +1122,7 @@ def _first_read_compress(
                 source_file_path=_safe_path,
                 language=language,
                 archived_from="first_read_skeleton",
-                output_text=_safe_skel[:50000],
+                output_text=_safe_skel,
             )
         except Exception:
             pass
@@ -1464,9 +1463,11 @@ def handle_read(hook_input: dict[str, Any], mode: str, quiet: bool) -> None:
         return
 
     # U-G3: if a proactive prior-session hint surfaced this exact file to this
-    # session, the agent reading it is observed evidence the hint spared an
-    # exploratory search to locate it. Credit once (claim_hint_follow flips the
-    # credited flag) with a conservative avoided-search estimate. Best-effort.
+    # session, the agent reading it is observed evidence the hint was followed.
+    # Whether it spared an exploratory search is counterfactual -- we see the
+    # read, not the search that did not happen -- so the credit is a fixed
+    # avoided-search ESTIMATE (claimed once: claim_hint_follow flips the flag),
+    # filed in the estimated tier downstream. Best-effort.
     try:
         if store.claim_hint_follow(file_path):
             _log_savings_event(
@@ -1482,15 +1483,24 @@ def handle_read(hook_input: dict[str, Any], mode: str, quiet: bool) -> None:
     # model's context: forget them so this Read is judged a first read.
     try:
         if _scan_for_compaction(store, hook_input.get("transcript_path")):
-            store.clear_file_entries()
+            if hook_input.get("agent_id"):
+                # A subagent keeps its own context; only its read ledger follows
+                # the transcript's compaction marker.
+                store.clear_file_entries()
+            else:
+                store.reset_context_state()
+                mark_context_reset(session_id)
             if not quiet:
                 print(
-                    f"[Read Cache] Compaction detected; cleared file_reads for {session_id}",
+                    f"[Read Cache] Compaction detected; reset context state for {session_id}",
                     file=sys.stderr,
                 )
     except Exception:
         pass
 
+    # U2: snapshot the reset epoch AFTER the compaction scan above; a reset
+    # landing before the record write drops the guarded upsert (reset_epoch.py).
+    reset_epoch = snapshot_reset_epoch(store)
     try:
         entry = store.get_file_entry(file_path)
     except Exception:
@@ -1542,7 +1552,7 @@ def handle_read(hook_input: dict[str, Any], mode: str, quiet: bool) -> None:
             except Exception:
                 pass
         _reset_replacement_state(entry)
-        store.upsert_file_entry(file_path, entry)
+        store.upsert_file_entry(file_path, entry, expected_reset_epoch=reset_epoch)
         # U5: first-read skeleton. Active cohorts serve a skeleton (returns True,
         # we stop here); others fall through to serve the full file + shadow-log.
         # Reuses content delta mode already read this turn (even when too large to
@@ -1733,7 +1743,7 @@ def handle_read(hook_input: dict[str, Any], mode: str, quiet: bool) -> None:
                             else:
                                 entry["content_hash"] = None
                                 store.delete_cached_content(file_path)
-                            store.upsert_file_entry(file_path, entry)
+                            store.upsert_file_entry(file_path, entry, expected_reset_epoch=reset_epoch)
 
                             net_saved = max(0, old_tokens - delta_tokens)
 
@@ -1843,7 +1853,7 @@ def handle_read(hook_input: dict[str, Any], mode: str, quiet: bool) -> None:
             except Exception:
                 pass
         _reset_replacement_state(entry)
-        store.upsert_file_entry(file_path, entry)
+        store.upsert_file_entry(file_path, entry, expected_reset_epoch=reset_epoch)
         _log_decision(
             "allow",
             file_path,
@@ -1885,7 +1895,7 @@ def handle_read(hook_input: dict[str, Any], mode: str, quiet: bool) -> None:
         decision = "warn" if mode == "warn" else "allow"
         entry["last_structure_reason"] = reason_code
         entry["last_structure_confidence"] = summary.confidence if summary else 0.0
-        store.upsert_file_entry(file_path, entry)
+        store.upsert_file_entry(file_path, entry, expected_reset_epoch=reset_epoch)
         _log_decision(
             decision,
             file_path,
@@ -1914,7 +1924,7 @@ def handle_read(hook_input: dict[str, Any], mode: str, quiet: bool) -> None:
     if eligible_structure and summary is not None:
         if _check_escape_hatch(
             entry, store, file_path, session_id, mode, offset, limit,
-            tokens_est, language, True, summary, save_hook_context_enabled, quiet,
+            tokens_est, language, True, summary, save_hook_context_enabled, quiet, reset_epoch,
         ):
             return
 
@@ -1925,7 +1935,7 @@ def handle_read(hook_input: dict[str, Any], mode: str, quiet: bool) -> None:
         entry["repeat_replacement_count"] = repeat_count
         entry["last_structure_reason"] = reason_code
         entry["last_structure_confidence"] = summary.confidence
-        store.upsert_file_entry(file_path, entry)
+        store.upsert_file_entry(file_path, entry, expected_reset_epoch=reset_epoch)
 
         if repeat_count == 1:
             replacement_tokens_est = summary.replacement_tokens_est
@@ -2007,11 +2017,11 @@ def handle_read(hook_input: dict[str, Any], mode: str, quiet: bool) -> None:
     if mode == "block":
         if _check_escape_hatch(
             entry, store, file_path, session_id, mode, offset, limit,
-            tokens_est, language, False, summary, save_hook_context_enabled, quiet,
+            tokens_est, language, False, summary, save_hook_context_enabled, quiet, reset_epoch,
         ):
             return
 
-        store.upsert_file_entry(file_path, entry)
+        store.upsert_file_entry(file_path, entry, expected_reset_epoch=reset_epoch)
         block_net_saved = max(0, tokens_est - REASON_ONLY_TOKENS_EST)
         _log_decision(
             "block",
@@ -2052,21 +2062,22 @@ def handle_read(hook_input: dict[str, Any], mode: str, quiet: bool) -> None:
 
 
 def handle_clear_compacted(hook_input: dict[str, Any], quiet: bool) -> None:
-    """Clear ONLY the current session's file_reads after a compaction.
+    """Reset ONE session's "already in context" state after a /clear or compaction.
 
-    Wired to SessionStart (matcher ``compact``) via the ``--clear-compacted``
-    flag, which reads ``session_id`` from the stdin hook input. Post-compaction
-    the live session's read cache is stale: an unchanged file whose ``file_reads``
-    row survives can be judged redundant on a re-Read even though compaction
-    dropped it from context.
+    Wired to SessionStart (sources ``compact`` and ``clear``) via the
+    ``--clear-compacted`` flag, which reads ``session_id`` from the stdin hook
+    input. Both events empty the model's context while the session id, and so the
+    session store, lives on. Left alone, an unchanged file whose ``file_reads``
+    row survives is judged redundant on the next Read and served as an outline or
+    a block even though the model no longer holds it, and the same goes for
+    delta baselines, cross-turn command outputs and repeat-command streaks.
 
-    Calls ``store.clear_file_entries()`` ONLY -- never ``handle_clear``'s
-    session-scoped branch, which also unlinks the decisions telemetry log
-    (``_decisions_log_path``) and the legacy cache json. Routed through
-    compaction, that branch would delete per-session decision/shadow telemetry
-    on every compaction. ``cached_content`` is intentionally kept: the delta-read
-    path is gated on the file entry existing, so clearing only ``file_reads`` is
-    safe and preserves the delta baseline for an edited file.
+    Calls ``store.reset_context_state()`` (and stamps the re-fetch guard's reset
+    marker) for the named session ONLY: other sessions and subagent stores are not
+    touched. It never takes ``handle_clear``'s session-scoped branch, which also
+    unlinks the decisions telemetry log (``_decisions_log_path``) and the legacy
+    cache json; that would delete per-session decision/shadow telemetry on every
+    reset.
 
     Contention-safe: SessionStore connects fail-fast
     (``busy_timeout=50ms``), so under a sibling SessionStart compact-restore or
@@ -2115,7 +2126,7 @@ def handle_clear_compacted(hook_input: dict[str, Any], quiet: bool) -> None:
         # honored by _connect() for BOTH the schema init and the DELETE, so the
         # clear waits out a sibling write lock within the hook budget instead
         # of dying at the 50ms fail-fast default during _init_schema.
-        store.clear_file_entries()
+        store.reset_context_state()
     except sqlite3.OperationalError as exc:
         # LOUD failure: never a silent exit-0 no-op that resurrects the bug.
         print(
@@ -2126,9 +2137,11 @@ def handle_clear_compacted(hook_input: dict[str, Any], quiet: bool) -> None:
         return
     finally:
         store.close()
+    if not hook_input.get("agent_id"):
+        mark_context_reset(session_id)
     if not quiet:
         print(
-            f"[Read Cache] Cleared compacted session file_reads for {session_id}",
+            f"[Read Cache] Reset session context state for {session_id}",
             file=sys.stderr,
         )
 
@@ -2192,6 +2205,17 @@ def handle_invalidate(hook_input: dict[str, Any], quiet: bool) -> None:
     store = _make_store(session_id)
     if store is None:
         return
+
+    # Same U2 contract as handle_read: a reset landing before the rewrite below
+    # must drop the write, not resurrect a pre-clear row.
+    _invalidate_epoch = snapshot_reset_epoch(store)
+
+    # Checkpoints can predate this edit. Preserve its path independently of
+    # cache entries, including edits to files that have never been read.
+    try:
+        store.record_file_edit(file_path)
+    except Exception:
+        pass
 
     # U5: resolve the first-read shadow quality proxy (edit-after-shadow-read).
     _resolve_first_read_shadow_on_edit(
@@ -2288,9 +2312,9 @@ def handle_invalidate(hook_input: dict[str, Any], quiet: bool) -> None:
                 existing["content_hash"] = None
                 store.delete_cached_content(file_path)
 
-        store.upsert_file_entry(file_path, existing)
+        written = store.upsert_file_entry(file_path, existing, expected_reset_epoch=_invalidate_epoch)
         if not quiet:
-            print(f"[Read Cache] Refreshed after edit: {file_path}", file=sys.stderr)
+            print(refresh_message(file_path, written), file=sys.stderr)
     except Exception:
         # Fallback: purge on any unexpected error so a stale entry is never
         # served.

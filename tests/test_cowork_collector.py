@@ -5,7 +5,9 @@ Covers the data-correctness fixes from the fable council review, all exercised
 through the public `--db <tmp>` seam against a temp DB and synthetic OTLP
 capture files. The real trends.db is never touched.
 """
+from helpers.measure_split import exec_source_module as _split_exec_module
 
+from _activity_fixtures import stamp_activity
 import importlib.util
 import io
 import json
@@ -56,12 +58,45 @@ def _load(name: str, path: Path):
     sys.path.insert(0, str(path.parent))
     spec = importlib.util.spec_from_file_location(name, str(path))
     mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    _split_exec_module(mod)
     return mod
 
 
 tc = _load("to_collector_under_test", COLLECTOR)
 measure = _load("measure_under_test", MEASURE)
+
+
+def test_production_loader_registers_facade_and_restores_live_predecessor(tmp_path):
+    """The collector's real loader must work while another facade is alive."""
+    previous = sys.modules['measure']
+    original_cost = previous._get_model_cost
+    original_price = original_cost('sonnet', 1000, 100)
+    with tc._measure_import_scope():
+        loaded, _ = tc._load_measure(str(MEASURE))
+        assert loaded is not None
+        assert sys.modules['measure'] is loaded
+        assert loaded._get_model_cost('sonnet', 1000, 100) == original_price
+    assert sys.modules['measure'] is previous
+    assert previous._get_model_cost is original_cost
+    assert original_cost('sonnet', 1000, 100) == original_price
+
+
+def test_production_ingest_loads_the_split_engine(tmp_path):
+    assert tc.ingest(tmp_path / 'empty', str(MEASURE), str(tmp_path / 'trends.db'), quiet=True) == 0
+
+
+def test_failed_candidate_cannot_poison_the_next_engine(tmp_path, monkeypatch):
+    import shutil
+    scripts = tmp_path / 'broken/scripts'
+    shutil.copytree(MEASURE.parent, scripts,
+                    ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+    (scripts / '_measure/runtime.py').write_text('raise RuntimeError("broken provider")\n', encoding='utf-8')
+    monkeypatch.setattr(tc, '_measure_candidates', lambda: [scripts / 'measure.py', MEASURE])
+    with tc._measure_import_scope():
+        loaded, _ = tc._load_measure(None)
+        assert loaded is not None
+        assert Path(loaded.__file__) == MEASURE
+        assert loaded._safe_int('7') == 7
 
 PRICED_MODEL = "claude-sonnet-4-20250514"
 
@@ -289,6 +324,7 @@ def test_quality_average_fold_is_not_nulled(tmp_path):
         "VALUES (?, ?, 'claude', 82, 'B', 100, 50, 'claude-uuid-1', 0.0)",
         ("/home/u/.claude/projects/p/claude-uuid-1.jsonl", LOCAL_DAY),
     )
+    stamp_activity(conn, platforms=("claude",))
     conn.commit()
     conn.close()
 
@@ -386,6 +422,7 @@ def test_later_claude_row_replaces_previously_ingested_cowork_copy(tmp_path):
             "(?, ?, 'claude', 4242, 111, 'late-claude-sid', 0.99)",
             ("/home/u/.claude/projects/p/late-claude-sid.jsonl", LOCAL_DAY),
         )
+        stamp_activity(conn, platforms=("claude",))
         conn.commit()
     finally:
         conn.close()
@@ -598,3 +635,14 @@ def test_shared_capture_directory_is_refused(tmp_path):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+def test_capture_usage_is_split_by_event_activity_day(tmp_path):
+    capture = tmp_path / "capture"
+    _write_capture(capture, [_api_record("multi-day", EVENING_NANOS),
+                             _api_record("multi-day", EVENING_NANOS + 86400 * 1_000_000_000)])
+    db = tmp_path / "trends.db"
+    assert _ingest(capture, db) == 0
+    with sqlite3.connect(str(db)) as conn:
+        rows = conn.execute("SELECT total_input,total_output FROM daily_stats ORDER BY date").fetchall()
+    assert rows == [(1300, 500), (1300, 500)]

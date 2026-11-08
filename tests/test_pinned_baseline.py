@@ -22,7 +22,8 @@ METRICS = {"sessions": 200, "usd": 900.0, "tokens": 1e9, "flat_usd": 1000.0,
 
 def _freeze(measure, month):
     (measure.SNAPSHOT_DIR / "workload_anchor.json").write_text(json.dumps({
-        "month": month, "metrics": METRICS, "rates": measure._WEIGHT_POOL_FLAT_RATES}))
+        "month": month, "metrics": METRICS, "rates": measure._WEIGHT_POOL_FLAT_RATES,
+        "activity_basis": 1}))
 
 
 def test_frozen_anchor_does_not_slide_to_a_later_month(tmp_path, monkeypatch):
@@ -81,7 +82,7 @@ def test_pre_install_anchor_without_surviving_transcripts_stops_trying(tmp_path,
 
 def test_savings_report_counts_avoided_re_reads(tmp_path, monkeypatch, capsys):
     measure = _load(tmp_path, monkeypatch)
-    monkeypatch.setattr(measure, "_reread_savings_for_window",
+    monkeypatch.setattr(measure, "_counted_cumulative_summary",
                         lambda days: {"available": True, "reread_tokens": 1_000_000, "reread_usd": 12.5})
     measure.savings_report(days=30)
     out = capsys.readouterr().out

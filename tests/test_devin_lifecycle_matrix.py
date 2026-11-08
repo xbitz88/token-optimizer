@@ -8,6 +8,7 @@ outside the Devin home touched, and a documented route back to an
 installable state. Where the previous release handled a cell safely, the
 current adapter must handle it too: the baseline column is the pin.
 """
+from __future__ import annotations
 
 import base64
 import hashlib
@@ -300,7 +301,8 @@ def test_lifecycle_cell(tmp_path, monkeypatch, state_name, command):
     cur_home.mkdir()
     base_home.mkdir()
     baseline_dir = tmp_path / 'baseline-src'
-    shutil.copytree(FIXTURE, baseline_dir)
+    from _devin_baseline import copy_baseline
+    copy_baseline(FIXTURE, baseline_dir)
 
     # Current-adapter cell home.
     if state_name.startswith('old_'):

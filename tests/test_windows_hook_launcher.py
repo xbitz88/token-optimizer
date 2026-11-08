@@ -6,6 +6,8 @@ via ``%COMSPEC% /C`` (cmd.exe), so codex_install.py uses native Windows
 quoting and an auditable Python launcher file at a stable path next to the
 versioned marketplace installs.
 """
+from helpers.measure_split import exec_source_module as _split_exec_module, measure_source as _split_measure_source, definition_nodes as _split_definition_nodes
+from _codex_record import record_codex  # noqa: E402
 
 import importlib.util
 import ast
@@ -41,22 +43,19 @@ HOOKS_JSON_TEMPLATE = (
 
 
 def _load_measure_hook_resolver(platform):
-    tree = ast.parse(MEASURE_PATH.read_text(encoding="utf-8"))
     wanted = {"_resolve_hook_command", "_windows_hook_command_is_stale"}
-    nodes = [node for node in tree.body
-             if isinstance(node, ast.FunctionDef) and node.name in wanted]
     namespace = {
         "Path": Path, "re": re, "shlex": shlex, "subprocess": subprocess,
         "sys": sys,
         "platform": type("Platform", (), {"system": staticmethod(lambda: platform)}),
     }
-    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(MEASURE_PATH), "exec"), namespace)
+    exec(compile(_split_definition_nodes(wanted, namespace, MEASURE_PATH), str(MEASURE_PATH), "exec"), namespace)
     return namespace
 
 
 def _load_measure_hook_command():
     """Exec the module-level win32 HOOK_COMMAND assignment."""
-    tree = ast.parse(MEASURE_PATH.read_text(encoding="utf-8"))
+    tree = ast.parse(_split_measure_source(MEASURE_PATH))
     node = None
     for candidate in tree.body:
         if not isinstance(candidate, ast.If):
@@ -80,7 +79,7 @@ def _load_codex_install(monkeypatch, platform):
     monkeypatch.syspath_prepend(str(MODULE_PATH.parent))
     spec = importlib.util.spec_from_file_location("codex_install_under_test", MODULE_PATH)
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    _split_exec_module(module)
     monkeypatch.setattr(module.sys, "platform", platform)
     return module
 
@@ -106,6 +105,8 @@ def _install_test_launcher(base: Path) -> Path:
     return target
 
 
+
+
 def test_windows_hook_command_invokes_stable_plain_launcher(monkeypatch, tmp_path):
     module = _load_codex_install(monkeypatch, "win32")
     root = tmp_path / "market" / "token-optimizer" / "5.13.14"
@@ -122,7 +123,9 @@ def test_windows_hook_command_invokes_stable_plain_launcher(monkeypatch, tmp_pat
     assert "b64decode" not in command
     assert "base64" not in command
     assert module._LAUNCHER_MARKER in command
-    assert module._is_token_optimizer_group({"hooks": [{"command": command}]})
+    # Ownership is exact bytes this install writes (a managed hook), not shape.
+    assert module._is_token_optimizer_group("Stop", module._managed_hooks()["Stop"][0])
+    assert not module._is_token_optimizer_group("Stop", {"hooks": [{"command": command + " "}]})
 
 
 def test_installer_generator_source_cannot_regress_to_encoded_exec(monkeypatch, tmp_path):
@@ -194,7 +197,10 @@ def test_legacy_base64_launcher_is_recognized_decodable_and_replaced(monkeypatch
     current = module._windows_launcher_command(
         tmp_path / "token-optimizer" / "5.13.14", "hooks/stop_runner.py", [], {})
     assert module.decode_launcher_command(legacy) == code
-    assert module._is_token_optimizer_group({"hooks": [{"command": legacy}]})
+    assert not module._is_token_optimizer_group("Stop", {"hooks": [{"command": legacy}]})  # unproven: kept
+    record_codex(module, tmp_path / "hooks.json", {"hooks": {"Stop": [{"hooks": [{"command": legacy}]}]}}, legacy)
+    assert module._is_token_optimizer_group("Stop", {"hooks": [{"command": legacy}]},
+                                            module._codex_proof(tmp_path / "hooks.json"))
     assert module._launcher_signature(legacy) == legacy
     assert module._launcher_signature(legacy) != module._launcher_signature(current)
     assert module.decode_launcher_command(current) is None
@@ -427,17 +433,21 @@ def test_windows_version_resolver_falls_back_and_logs_only_under_debug(monkeypat
     assert str(base / "5.11.75") in log.read_text()
 
 
-def test_legacy_markerless_windows_groups_are_replaced_on_reinstall(monkeypatch):
+def test_legacy_markerless_windows_groups_are_replaced_on_reinstall(monkeypatch, tmp_path):
     module = _load_codex_install(monkeypatch, "win32")
     legacy = {"hooks": [{"command":
         'set "TOKEN_OPTIMIZER_RUNTIME_ROOT=C:\\old\\token-optimizer\\5.13.2" && '
         'python "C:\\old\\token-optimizer\\%R\\hooks\\run.py" hooks/stop_runner.py'}]}
     foreign = {"hooks": [{"command": "echo not ours"}]}
-    assert module._is_token_optimizer_group(legacy)
-    assert not module._is_token_optimizer_group(foreign)
+    assert not module._is_token_optimizer_group("Stop", legacy)  # shape alone proves nothing
+    record_codex(module, tmp_path / "hooks.json", {"hooks": {"Stop": [legacy]}}, legacy["hooks"][0]["command"])
+    proof = module._codex_proof(tmp_path / "hooks.json")
+    assert module._is_token_optimizer_group("Stop", legacy, proof)
+    assert not module._is_token_optimizer_group("Stop", foreign, proof)
+    assert not module._is_token_optimizer_group("SessionStart", legacy, proof)  # same bytes, other event
     fixed = {"hooks": [{"command": "fixed"}]}
     monkeypatch.setattr(module, "_managed_hooks", lambda **kw: {"Stop": [fixed]})
-    merged = module._merge_hooks({"hooks": {"Stop": [legacy, foreign]}})
+    merged = module._merge_hooks({"hooks": {"Stop": [legacy, foreign]}}, proof=proof)
     assert merged["hooks"]["Stop"] == [foreign, fixed]
 
 
@@ -445,7 +455,7 @@ def test_foreign_hook_referencing_runtime_root_is_never_touched(monkeypatch):
     module = _load_codex_install(monkeypatch, "win32")
     foreign = {"hooks": [{"command":
         'set "TOKEN_OPTIMIZER_RUNTIME_ROOT=C:\\mine" && python mine.py'}]}
-    assert not module._is_token_optimizer_group(foreign)
+    assert not module._is_token_optimizer_group("Stop", foreign)
     fixed = {"hooks": [{"command": "fixed"}]}
     monkeypatch.setattr(module, "_managed_hooks", lambda **kw: {"Stop": [fixed]})
     assert module._merge_hooks({"hooks": {"Stop": [foreign]}})["hooks"]["Stop"] == [foreign, fixed]
@@ -666,7 +676,7 @@ def test_measure_py_has_no_cmd_null_redirect_anywhere():
     """Source-grep guard: the cmd.exe null redirect must never reappear in
     measure.py. (codex_install.py is exempt: Codex spawns hooks via
     %COMSPEC% /C, so cmd syntax is correct there.)"""
-    src = MEASURE_PATH.read_text(encoding="utf-8")
+    src = _split_measure_source(MEASURE_PATH)
 
     assert _CMD_NUL_RE.search(src) is None, (
         "cmd.exe null redirect found in measure.py; Claude Code runs hooks "
@@ -709,42 +719,48 @@ def _load_full_measure():
         sys.path.insert(0, scripts)
     spec = importlib.util.spec_from_file_location("measure_hookcurrent_uut", MEASURE_PATH)
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    _split_exec_module(module)
     return module
+
+
+def _session_end(command):
+    return {"hooks": {"SessionEnd": [{"hooks": [{"type": "command", "command": command}]}]}}
 
 
 def test_windows_legacy_nul_sessionend_hook_reads_as_not_current(monkeypatch):
     """The pre-fix >NUL SessionEnd command matched all three
     substrings and read as 'current', so existing broken Windows installs were
     never healed ('already up to date. Nothing to do.'). It must now read as
-    NOT current on win32 so setup_hook's upgrade branch rewrites it."""
+    NOT current on win32 so setup_hook's upgrade branch rewrites it. Each
+    command is the exact one setup_hook generated on Windows (sys.executable,
+    this install's measure.py); the same text at a path that is not an
+    install is a user's own and never counts."""
     measure = _load_full_measure()
+    import owned_hooks
     monkeypatch.setattr(measure.sys, "platform", "win32")
-    legacy = (
-        "python.exe C:/p/measure.py collect --quiet && "
-        "python.exe C:/p/measure.py dashboard --quiet >NUL 2>&1"
-    )
-    legacy_settings = {"hooks": {"SessionEnd": [{"hooks": [{"type": "command", "command": legacy}]}]}}
-    assert measure._is_hook_current(legacy_settings) is False
+    py, mp = "C:/Python311/python.exe", str(MEASURE_PATH)
+    legacy, good_fossil, _, flush = (shape(py, mp) for shape in owned_hooks.SESSION_END_SHAPES[3:7])
+    assert ">NUL 2>&1" in legacy and ">/dev/null 2>&1" in good_fossil
+    assert measure._is_hook_current(_session_end(legacy)) is False
     # The collect/dashboard shape is never current, even with bash-safe redirect.
-    good_fossil = legacy.replace(">NUL 2>&1", ">/dev/null 2>&1")
-    good_fossil_settings = {"hooks": {"SessionEnd": [{"hooks": [{"type": "command", "command": good_fossil}]}]}}
-    assert measure._is_hook_current(good_fossil_settings) is False
-    flush = "python.exe C:/p/measure.py session-end-flush --trigger end >/dev/null 2>&1"
-    flush_settings = {"hooks": {"SessionEnd": [{"hooks": [{"type": "command", "command": flush}]}]}}
-    assert measure._is_hook_current(flush_settings) is True
+    assert measure._is_hook_current(_session_end(good_fossil)) is False
+    assert measure._is_hook_current(_session_end(flush)) is True
+    # The generated command spells measure.py with forward slashes.
+    foreign = flush.replace(mp.replace("\\", "/"), "C:/p/measure.py")
+    assert foreign != flush
+    assert measure._is_hook_current(_session_end(foreign)) is False
 
 
 def test_posix_nul_sessionend_hook_is_win32_gated(monkeypatch):
-    """The >NUL staleness heuristic is win32-only; POSIX never emits >NUL."""
+    """The >NUL staleness check is win32-only: on POSIX our generated
+    commands read as they are (fossil never current, flush current)."""
     measure = _load_full_measure()
+    import owned_hooks
     monkeypatch.setattr(measure.sys, "platform", "linux")
-    fossil = "python3 /p/measure.py collect --quiet && python3 /p/measure.py dashboard --quiet >NUL 2>&1"
-    fossil_settings = {"hooks": {"SessionEnd": [{"hooks": [{"type": "command", "command": fossil}]}]}}
-    assert measure._is_hook_current(fossil_settings) is False
-    flush = "python3 /p/measure.py session-end-flush --trigger end >NUL 2>&1"
-    flush_settings = {"hooks": {"SessionEnd": [{"hooks": [{"type": "command", "command": flush}]}]}}
-    assert measure._is_hook_current(flush_settings) is True
+    mp = str(MEASURE_PATH)
+    fossil, flush = owned_hooks.SESSION_END_SHAPES[2]("python3", mp), owned_hooks.SESSION_END_SHAPES[5]("python3", mp)
+    assert measure._is_hook_current(_session_end(fossil)) is False
+    assert measure._is_hook_current(_session_end(flush)) is True
 
 
 def test_windows_resolved_command_matches_native_root_after_normalization():
@@ -765,7 +781,7 @@ def test_setup_all_hooks_containment_is_separator_normalized():
     settings.json rewrite on Windows (forward-slash resolved root never
     contains the native-backslash plugin_root_str) — this test fails on that
     revert."""
-    src = MEASURE_PATH.read_text(encoding="utf-8")
+    src = _split_measure_source(MEASURE_PATH)
     # The buggy raw predicate must NOT be the active containment test.
     assert "plugin_root_str in existing_cmd" not in src, (
         "raw (un-normalized) containment reintroduces the F2 rewrite loop"

@@ -19,14 +19,15 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import shlex
 import stat as _stat
 import sys
 from pathlib import Path
 
 import pytest
 
-# antigravity_install refuses native Windows by design (the persisted hook
-# command is POSIX-shell quoted); install/uninstall/doctor paths are POSIX-only.
+# These tests assert POSIX file modes and the POSIX command form; the Windows
+# form is covered by test_antigravity_native_windows.py.
 pytestmark = pytest.mark.skipif(os.name == "nt", reason="install paths are POSIX-only on this adapter")
 
 REPO = Path(__file__).resolve().parent.parent
@@ -94,6 +95,22 @@ def test_install_writes_payload_hooks_plugin_and_consent(ai, tmp_path):
     consent = json.loads((ai.data_dir(home) / "config.json").read_text())
     assert consent[ai.CONSENT_KEY] is True
     assert result["dry_run"] is False
+
+
+def test_installed_hooks_call_the_installed_bridge(ai, tmp_path):
+    """Regression: hooks.json named the staging dir, which the install then
+    renamed away, so no hook could ever find its bridge."""
+    import json
+    ai.install(home=tmp_path)
+    pdir = ai.plugin_dir(tmp_path)
+    group = json.loads((pdir / "hooks.json").read_text(encoding="utf-8"))["token-optimizer"]
+    cmds = [h["command"] for h in group["PreInvocation"] + group["Stop"]]
+    cmds += [h["command"] for g in group["PreToolUse"] for h in g["hooks"]]
+    bridge = pdir / "antigravity_hook_bridge.py"
+    assert bridge.is_file()
+    for cmd in cmds:
+        assert ".stage." not in cmd
+        assert shlex.split(cmd)[-2] == str(bridge)
 
 
 def test_dry_run_writes_nothing_but_reports_plugin_dir(ai, tmp_path):
@@ -195,6 +212,39 @@ def test_main_install_and_uninstall_return_zero(ai, tmp_path, capsys):
     # real actions return 0 on success.
     rc = ai.main(["uninstall", "--dry-run"])
     assert rc == 0
+
+
+_TOMLI_PAYLOAD_PROBE = r'''
+import os, sys, importlib.abc
+class _NoStdlibToml(importlib.abc.MetaPathFinder):
+    def find_spec(self, name, path=None, target=None):
+        if name == "tomllib":
+            raise ImportError("simulated Python 3.9/3.10")
+sys.meta_path.insert(0, _NoStdlibToml())
+sys.path.insert(0, sys.argv[1])
+os.environ["TOKEN_OPTIMIZER_COMMAND_FILTERS"] = sys.argv[2]
+import command_filters
+print(command_filters.load_filters().excludes)
+'''
+
+
+def test_payload_parses_command_filters_without_stdlib_tomllib(ai, tmp_path):
+    """The copied payload must carry _tomli.py: on Python 3.9/3.10 there is no
+    tomllib, so the vendored _tomli module is command_filters' only TOML parser.
+    Without it load_filters() warns once and returns an empty config, silently
+    dropping the user's filters."""
+    import subprocess
+    ai.install(home=tmp_path)
+    pdir = ai.plugin_dir(tmp_path)
+    filters = tmp_path / "command-filters.toml"
+    filters.write_text('[filters.exclude]\ncommands = ["git log"]\n')
+    py = "/usr/bin/python3" if os.path.exists("/usr/bin/python3") else sys.executable
+    out = subprocess.run(
+        [py, "-c", _TOMLI_PAYLOAD_PROBE, str(pdir), str(filters)],
+        capture_output=True, text=True, cwd=str(tmp_path), timeout=60,
+    )
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == "('git log',)", out.stdout + out.stderr
 
 
 @pytest.fixture(autouse=True)

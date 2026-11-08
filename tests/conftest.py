@@ -74,6 +74,27 @@ import _home_guard  # noqa: E402
 _home_guard.install_sandbox()
 _home_guard.install_guard()
 
+
+@pytest.fixture(autouse=True)
+def _canonical_measure_fixture(request):
+    """Restore canonical identity even when a legacy fixture pops/reloads it.
+
+    Collection-time imports belong to their test module. Select that module's
+    facade before its tests, while custom fixture loaders select theirs later.
+    """
+    previous = sys.modules.get('measure')
+    namespace = getattr(request.module, '__dict__', {})
+    candidates = [value for value in namespace.values()
+                  if isinstance(value, type(sys)) and
+                  Path(getattr(value, '__file__', '') or '').name == 'measure.py']
+    if len({id(value) for value in candidates}) == 1:
+        sys.modules['measure'] = candidates[0]
+    yield
+    if previous is None:
+        sys.modules.pop('measure', None)
+    else:
+        sys.modules['measure'] = previous
+
 # A hook that finds measure.py's bytecode cold waits for the background compile
 # only as long as the host's hook timeout allows, then exits without output
 # (#264, hooks/module_runner.py). Test sandboxes start cold, and the compile
@@ -353,6 +374,34 @@ def _restore_runtime_env():
         else:
             os.environ[key] = value
     _clear_runtime_cache()
+
+
+@pytest.fixture(autouse=True)
+def _cwd_outside_real_home(monkeypatch):
+    """Keep default project discovery inside the test sandbox.
+
+    Product code discovers project files by walking up from the working
+    directory (``measure_components`` reads ``<ancestor>/CLAUDE.md`` and
+    ``<ancestor>/.claude/CLAUDE.md`` for the cwd's parents). A checkout under
+    the real home, as on a developer machine, puts the real ``~/.claude/CLAUDE.md``
+    on that walk even though the test's HOME is the sandbox, so the test reads
+    real user data and its result depends on that machine. CI checkouts sit
+    outside any home with a CLAUDE.md, which hid it. A test that needs another
+    cwd calls ``monkeypatch.chdir`` itself.
+    """
+    sandbox = _home_guard.SANDBOX
+    if sandbox is None:
+        return
+    try:
+        cwd = os.path.realpath(os.getcwd())
+    except OSError:
+        return
+    real_home = _home_guard.REAL_HOME
+    if cwd == real_home or cwd.startswith(real_home + os.sep):
+        # Project discovery checks three ancestors, all of which must be fake.
+        workdir = sandbox / "cwd" / "project" / "work"
+        workdir.mkdir(parents=True, exist_ok=True)
+        monkeypatch.chdir(workdir)
 
 
 @pytest.fixture(autouse=True)

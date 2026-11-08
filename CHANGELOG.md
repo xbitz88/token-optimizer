@@ -1,5 +1,62 @@
 # Changelog
 
+## [Unreleased]
+
+## [5.13.68] - 2026-11-07
+
+- Your own hooks are safe: repair, cleanup and uninstall only touch hooks Token Optimizer can prove it wrote, even when yours share our script names.
+- Custom command filters now work on Copilot, Cursor and Grok, and keep working on Antigravity and Devin with Python 3.9 and 3.10.
+- Codex hooks are tracked per entry and upgrade cleanly on Windows, and their tracking file lives in Codex's own folder, not your repo.
+- Doctor hides likely secrets in hook commands and only flags hooks that really look like ours.
+- The desktop band can show times in 12 or 24 hour format.
+
+## [5.13.67] - 2026-11-07
+
+- Python 3.9 and 3.10 are fully supported again: custom command filters and Codex config load there, and CI now tests both.
+- Hooks start faster: Bash calls no longer wait on a silent no-op hook, and users with no custom filter rules skip filter parsing entirely.
+- Custom command filters never compress destructive commands, even when a user rule matches them.
+- Hook cleanup in settings.json only removes hooks Token Optimizer can prove it wrote, so other tools' hooks stay put.
+- Verified installs work on older git, and a failed update returns you to the branch you started on.
+- Steadier data: the read cache stays correct after /clear, keep-warm sends one ping instead of duplicates, and Antigravity copes with a read-only data folder.
+
+## [5.13.66] - 2026-11-06
+
+- Token Optimizer's engine is now split into smaller modules, so it loads faster and is easier to keep reliable. Same results, same savings.
+
+## [5.13.65] - 2026-11-06
+
+- Fixes the desktop band failing to load after 5.13.64 ("Export named 'COMPACT_HEAVY' not found"). The quality card now appears only when quality is low or recovery after a compaction needs attention (#307).
+
+## [5.13.64] - 2026-11-05
+
+- A truer "more work per token" figure. Usage is now dated by the day it actually happened, not by when a session file was last touched, so old sessions no longer pile into this month and drag the number down. Upgrading re-dates your history once; the change is reversible and figures are labelled as estimates.
+- One routing number everywhere. The plan card, Savings tab and "Your transformation" all use the same model-routing math, and say plainly when part of your usage can't be compared (Cursor totals, older history).
+- Measured means measured. Checkpoint restores, lean resumes, loop warnings and hint-follow credits are shown as estimates on every surface, including OpenCode and OpenClaw, whose totals now add these estimates and can read higher. Fresh-session nudges show savings per turn and when they pay back.
+- Compactions no longer cost you quality points. Long sessions that compact normally stay green; recovery after a compaction is tracked quietly while it is calibrated. Size suggestions only appear above 300K tokens of live context, so 200K windows never see them.
+- Richer checkpoints. Each checkpoint keeps your goal, constraints, files changed, checks run, dead ends and the next step, and resume picks the latest valid one instead of an older, longer one.
+- Read just the part you need. `expand` takes line ranges, character ranges and search matches with surrounding context, prints the command for the next window, and only charges what it returns. Search now covers the whole archived output.
+- Windows: MEMORY.md is charged to the right project, skill docs use a Windows-safe Python, and the MCP estimate includes server instructions and honours enabled/disabled project servers (#301).
+- No more repeated resume block on every subagent notification: harness prompts are ignored and an identical block is injected once per session (#303).
+- Cursor and Antigravity dashboards no longer show Claude-only rows or controls (#300).
+- Same rules everywhere: Claude Code, Codex, Cowork, OpenClaw (2.4.26), OpenCode (1.2.2) and the VS Code companion (0.1.19). How every number is measured: `docs/METHODOLOGY.md`.
+
+## [5.13.63] - 2026-11-01
+
+- One monthly savings number. Logged savings, routing you actually used, repeat reads avoided and estimates are added up once, with nothing counted twice. The CLI and dashboard show the same figure.
+- Your total since install. The dashboard and CLI show everything saved since you installed, using the same four parts as the monthly number. After updating, a one-time background pass re-reads your history; figures say "so far" until it finishes.
+- Usage counted once. A request that streams or replays across sessions is counted a single time, so token totals and costs match what you used.
+- A realistic "money on the table" card. The model-routing "what if" assumes about 20% of Opus work could move to a cheaper model, looks only at new input and output, and sits outside your total. When two ways of estimating disagree, the dashboard says so instead of showing a headline number.
+- Full files after /clear. After /clear or compaction, the first Read returns the full file again (#295).
+- Antigravity, Cursor and Grok install on native Windows. Hook commands now use a form PowerShell and cmd.exe both run, instead of the installer refusing (#296).
+- Antigravity: hooks fire again. Since 5.13.5 the installer pointed them at a temporary folder that no longer existed. Re-run `antigravity-install` once; `antigravity-doctor` now flags the old setup.
+- Hermes dashboard shows your real setup: skills from `~/.hermes/skills/`, MCP servers from `config.yaml`, plus SOUL.md and memory, and no longer counts Token Optimizer's own plugin code as context (#298).
+- Hermes dashboard labels name Hermes instead of Claude Code, and the CLAUDE.md health card no longer appears there (#297).
+- Same rules everywhere: Claude Code, Codex, Cowork, OpenClaw (2.4.25), OpenCode (1.2.1), Hermes (plugin 0.2.2), Pi and the VS Code companion (0.1.18). How every number is measured: `docs/METHODOLOGY.md`.
+
+## [5.13.62] - 2026-11-01
+
+- Up-to-date model prices: gpt-6-astra-law.
+
 ## [5.13.61] - 2026-10-31
 
 - Up-to-date model prices: gpt-6-rosalind.

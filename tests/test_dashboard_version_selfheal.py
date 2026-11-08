@@ -27,6 +27,8 @@ test_runway_card_wiring.py / test_dashboard_regen_retry.py take).
 
 Run: python3 -m pytest tests/test_dashboard_version_selfheal.py -v
 """
+from helpers.measure_split import inspect_source as _split_inspect_source
+from _activity_fixtures import stamp_activity
 import importlib
 import inspect
 import sqlite3
@@ -136,7 +138,7 @@ def test_dispatch_dashboard_defaults_to_no_force(m, monkeypatch):
 # --------------------------------------------------------------------------
 
 def test_ensure_health_hands_html_heal_to_detached_forced_child(m):
-    src = inspect.getsource(m.run_ensure_health)
+    src = _split_inspect_source(m.run_ensure_health)
     # The stale-HTML branch must hand off to the detached, forced child...
     assert "_spawn_detached_dashboard_selfheal(days=30, force=True, hook_timeout=False)" in src, (
         "the stale-HTML self-heal must spawn the detached forced child, not run "
@@ -154,7 +156,7 @@ def test_ensure_health_daemon_update_runs_after_html_heal(m):
     the HTML self-heal. With the heal now a fast detached spawn, the tick always
     reaches the daemon update -- the block that was stranded when the in-process
     regen blew the budget."""
-    src = inspect.getsource(m.run_ensure_health)
+    src = _split_inspect_source(m.run_ensure_health)
     heal_at = src.index("_spawn_detached_dashboard_selfheal(days=30, force=True, hook_timeout=False)")
     daemon_at = src.index('TOKEN_OPTIMIZER_DAEMON_VERSION = "')
     assert heal_at < daemon_at, "HTML heal must precede the daemon-script update"
@@ -251,10 +253,11 @@ def _temp_trends(m, monkeypatch):
                  (today, 1_000_000, 200_000))
     conn.execute("INSERT INTO savings_events(timestamp,event_type,tokens_saved) VALUES(?,?,?)",
                  (now_iso, "archive", 50_000))
+    stamp_activity(conn)
     conn.commit()
     conn.close()
     monkeypatch.setattr(m, "_init_trends_db", lambda: sqlite3.connect(str(dbp)))
-    monkeypatch.setattr(m, "_input_rate_mix_ratio", lambda days=30: 1.4)
+    monkeypatch.setattr(m, "_runway_routing_lever", lambda days=30: {"state": "estimated", "factor": 1.4})
 
 
 def test_healthy_meter_fills_runway_windows(m, monkeypatch):
@@ -332,7 +335,7 @@ def test_heal_spawn_due_reclaims_stale_marker(m):
 
 def test_ensure_health_guards_spawn_with_herd_lock(m):
     """Every self-heal call, including ensure-health, uses the central spawn guard."""
-    src = inspect.getsource(m._spawn_detached_dashboard_selfheal)
+    src = _split_inspect_source(m._spawn_detached_dashboard_selfheal)
     guard_at = src.index("_dashboard_heal_spawn_due()")
     spawn_at = src.index("subprocess.Popen(")
     assert guard_at < spawn_at, "the herd guard must gate the spawn, not follow it"

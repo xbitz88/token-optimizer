@@ -24,6 +24,7 @@ Configuration:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -33,11 +34,17 @@ from pathlib import Path
 from typing import Any, Optional
 
 from plugin_env import resolve_snapshot_dir
+from reset_epoch import ResetEpochMixin, bump_reset_epoch
 
 SNAPSHOT_DIR = resolve_snapshot_dir()
 SESSION_STORE_DIR = SNAPSHOT_DIR / "session-store"
 
 MAX_DB_SIZE_BYTES = 50 * 1024 * 1024  # 50MB cap
+# tool_outputs.output_text is a search index copy, not the recovery source (the
+# archive sidecar keeps the full redacted body). Bound it so a few multi-MB
+# archives cannot fill the 50MB session DB and pause every later write.
+MAX_TOOL_OUTPUT_INDEX_BYTES = 256 * 1024
+_INDEX_TRUNCATED_MARKER = "\n[... index truncated ...]\n"
 CLEANUP_AGE_HOURS = 48
 
 # v2: added tool_outputs lineage columns + the FTS5 archive index, and
@@ -76,7 +83,9 @@ CREATE TABLE IF NOT EXISTS tool_outputs (
     source_file_path TEXT,
     language TEXT,
     archived_from TEXT,
-    output_text TEXT
+    output_text TEXT,
+    truncated INTEGER,
+    index_truncated INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS command_outputs (
@@ -162,7 +171,28 @@ def _sanitize_session_id(sid: str) -> str:
     return sid
 
 
-class SessionStore:
+def _bound_tool_output_index(text: Optional[str]):
+    """Bound ``output_text`` to a head+tail search index.
+
+    Returns ``(index_text, index_truncated)``. The full redacted body still lives
+    in the archive sidecar; this column only feeds FTS/LIKE search, so keeping a
+    bounded head and tail preserves findability without letting a few multi-MB
+    outputs fill the per-session database cap.
+    """
+    if text is None:
+        return None, 0
+    raw = text.encode("utf-8", "replace")
+    if len(raw) <= MAX_TOOL_OUTPUT_INDEX_BYTES:
+        return text, 0
+    marker = _INDEX_TRUNCATED_MARKER.encode("utf-8")
+    head_budget = MAX_TOOL_OUTPUT_INDEX_BYTES // 2
+    tail_budget = MAX_TOOL_OUTPUT_INDEX_BYTES - head_budget - len(marker)
+    head = raw[:head_budget].decode("utf-8", "ignore")
+    tail = raw[len(raw) - tail_budget:].decode("utf-8", "ignore") if tail_budget > 0 else ""
+    return head + _INDEX_TRUNCATED_MARKER + tail, 1
+
+
+class SessionStore(ResetEpochMixin):
     """Per-session SQLite store for tool output caching."""
 
     def __init__(
@@ -276,10 +306,17 @@ class SessionStore:
             cols = {r[1] for r in conn.execute("PRAGMA table_info(tool_outputs)").fetchall()}
         except sqlite3.DatabaseError:
             return
-        for col in ("source_file_path", "language", "archived_from", "output_text"):
+        for col, decl in (
+            ("source_file_path", "TEXT"),
+            ("language", "TEXT"),
+            ("archived_from", "TEXT"),
+            ("output_text", "TEXT"),
+            ("truncated", "INTEGER"),
+            ("index_truncated", "INTEGER"),
+        ):
             if col not in cols:
                 try:
-                    conn.execute(f"ALTER TABLE tool_outputs ADD COLUMN {col} TEXT")
+                    conn.execute(f"ALTER TABLE tool_outputs ADD COLUMN {col} {decl}")
                 except sqlite3.OperationalError:
                     pass
 
@@ -506,51 +543,6 @@ class SessionStore:
                 entry["ranges_seen"] = []
         return entry
 
-    def upsert_file_entry(self, file_path: str, entry: dict[str, Any]) -> None:
-        conn = self._connect()
-        ranges_json = json.dumps(entry.get("ranges_seen", []))
-        conn.execute(
-            """INSERT INTO file_reads
-               (file_path, mtime_ns, size_bytes, ranges_seen, tokens_est,
-                read_count, content_hash, last_access,
-                last_replacement_fingerprint, last_replacement_type,
-                repeat_replacement_count, last_structure_reason,
-                last_structure_confidence, last_tool_use_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(file_path) DO UPDATE SET
-                 mtime_ns=excluded.mtime_ns,
-                 size_bytes=excluded.size_bytes,
-                 ranges_seen=excluded.ranges_seen,
-                 tokens_est=excluded.tokens_est,
-                 read_count=excluded.read_count,
-                 content_hash=excluded.content_hash,
-                 last_access=excluded.last_access,
-                 last_replacement_fingerprint=excluded.last_replacement_fingerprint,
-                 last_replacement_type=excluded.last_replacement_type,
-                 repeat_replacement_count=excluded.repeat_replacement_count,
-                 last_structure_reason=excluded.last_structure_reason,
-                 last_structure_confidence=excluded.last_structure_confidence,
-                 last_tool_use_id=excluded.last_tool_use_id
-            """,
-            (
-                file_path,
-                int(entry.get("mtime_ns", 0)),
-                int(entry.get("size_bytes", 0)),
-                ranges_json,
-                int(entry.get("tokens_est", 0)),
-                int(entry.get("read_count", 1)),
-                entry.get("content_hash"),
-                float(entry.get("last_access", time.time())),
-                entry.get("last_replacement_fingerprint", ""),
-                entry.get("last_replacement_type", ""),
-                int(entry.get("repeat_replacement_count", 0)),
-                entry.get("last_structure_reason", ""),
-                float(entry.get("last_structure_confidence", 0.0)),
-                entry.get("last_tool_use_id", ""),
-            ),
-        )
-        conn.commit()
-
     def delete_file_entry(self, file_path: str) -> None:
         conn = self._connect()
         conn.execute("DELETE FROM file_reads WHERE file_path = ?", (file_path,))
@@ -572,8 +564,40 @@ class SessionStore:
 
     def clear_file_entries(self) -> None:
         conn = self._connect()
-        conn.execute("DELETE FROM file_reads")
-        conn.commit()
+        with conn:
+            conn.execute("DELETE FROM file_reads")
+            # U2: same epoch contract as reset_context_state for the
+            # subagent-ledger reset path.
+            bump_reset_epoch(conn)
+
+    def reset_context_state(self) -> None:
+        """Forget everything that records what the model currently holds.
+
+        A /clear or a compaction empties the model's context while the session
+        id (and so this store) lives on. Every record that later lets a hook say
+        "you already have this" must go with it: the read ledger, the delta-read
+        baselines, the cross-turn command outputs, the repeat-command streaks, the
+        served-hint ledger and the first-read skeleton markers. Nothing here is a
+        recovery source: the tool-output archive, activity log, compaction
+        cursor and decision notes stay, because they describe the session, not
+        the context window. One transaction, so a lock failure leaves the old
+        state intact rather than half-cleared.
+        """
+        conn = self._connect()
+        with conn:
+            conn.execute("DELETE FROM file_reads")
+            conn.execute("DELETE FROM cached_content")
+            conn.execute("DELETE FROM command_outputs")
+            conn.execute("DELETE FROM command_run_streaks")
+            conn.execute("DELETE FROM hint_serves")
+            conn.execute(
+                "DELETE FROM session_meta WHERE key GLOB 'shadow_fr:*' "
+                "OR key GLOB 'active_fr:*'"
+            )
+            # U2: bump the reset epoch in the same transaction so a writer
+            # that judged pre-reset state can detect the reset landed before
+            # its record write (see upsert_file_entry's expected_reset_epoch).
+            bump_reset_epoch(conn)
 
     # ----- cached_content -----
 
@@ -623,23 +647,27 @@ class SessionStore:
         language: Optional[str] = None,
         archived_from: Optional[str] = None,
         output_text: Optional[str] = None,
+        truncated: Optional[int] = None,
     ) -> None:
         if self._is_over_size_cap():
             return
+        index_text, index_truncated = _bound_tool_output_index(output_text)
         conn = self._connect()
         conn.execute(
             """INSERT OR IGNORE INTO tool_outputs
                (tool_use_id, tool_name, tool_type, command_or_path,
                 output_hash, output_chars, output_tokens_est,
                 compressed_preview, timestamp,
-                source_file_path, language, archived_from, output_text)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                source_file_path, language, archived_from, output_text,
+                truncated, index_truncated)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 tool_use_id, tool_name, tool_type, command_or_path,
                 output_hash, output_chars, output_tokens_est,
                 compressed_preview, time.time(),
-                source_file_path, language, archived_from, output_text,
+                source_file_path, language, archived_from, index_text,
+                truncated, index_truncated,
             ),
         )
         # fix-1: the external-content FTS mirror is maintained by the AFTER
@@ -651,9 +679,10 @@ class SessionStore:
     # ----- tool_outputs search (U6: FTS5 with LIKE fallback) -----
 
     def search_tool_outputs(self, query: str, limit: int = 20) -> list[dict[str, Any]]:
-        """Full-text search over archived tool outputs Returns rows of (tool_use_id, tool_name, command_or_path,
-        source_file_path, language, archived_from, snippet) ranked by
-        relevance. Uses FTS5 ``bm25()`` when available; falls back to a
+        """Full-text search over archived tool outputs Returns rows carrying
+        (tool_use_id, tool_name, command_or_path, source_file_path, language,
+        archived_from, output_hash, output_chars, timestamp, truncated,
+        index_truncated, snippet) ranked by relevance. Uses FTS5 ``bm25()`` when available; falls back to a
         bounded ``LIKE '%term%'`` query over the lineage + output_text
         columns when FTS5 is not compiled into SQLite. Never raises: an
         empty/invalid query or a missing index returns an empty list.
@@ -667,6 +696,8 @@ class SessionStore:
                 rows = conn.execute(
                     """SELECT t.tool_use_id, t.tool_name, t.command_or_path,
                               t.source_file_path, t.language, t.archived_from,
+                              t.output_hash, t.output_chars, t.timestamp, t.truncated,
+                              t.index_truncated,
                               snippet(tool_outputs_fts, 6, '>>', '<<', '...', 16) AS snippet
                        FROM tool_outputs_fts f
                        JOIN tool_outputs t ON t.rowid = f.rowid
@@ -693,6 +724,8 @@ class SessionStore:
             rows = conn.execute(
                 r"""SELECT tool_use_id, tool_name, command_or_path,
                           source_file_path, language, archived_from,
+                          output_hash, output_chars, timestamp, truncated,
+                          index_truncated,
                           substr(COALESCE(output_text, compressed_preview, ''), 1, 200) AS snippet
                    FROM tool_outputs
                    WHERE tool_name LIKE ? ESCAPE '\' OR command_or_path LIKE ? ESCAPE '\'
@@ -809,6 +842,15 @@ class SessionStore:
             (key, value),
         )
         conn.commit()
+
+    def record_file_edit(self, file_path: str) -> None:
+        """Keep edit evidence without persisting credential-shaped path text."""
+        fingerprint = hashlib.sha256(file_path.encode("utf-8")).hexdigest()
+        self.set_meta("checkpoint_edit:" + fingerprint, "1")
+
+    def was_file_edited(self, file_path: str) -> bool:
+        fingerprint = hashlib.sha256(file_path.encode("utf-8")).hexdigest()
+        return self.get_meta("checkpoint_edit:" + fingerprint) == "1"
 
     # ----- context_intel_events -----
 
@@ -958,6 +1000,45 @@ class SessionStore:
             (min_tokens, limit),
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+def _context_reset_marker(session_id: str, snapshot_dir: Optional[Path] = None) -> Optional[Path]:
+    # An id the archive would not accept maps to no marker, so a malformed id
+    # can never fork a stray directory.
+    if not session_id or not re.match(r"^[a-zA-Z0-9_-]+\Z", session_id):
+        return None
+    base = snapshot_dir or resolve_snapshot_dir()
+    return base / "tool-archive" / session_id / "context_reset_at"
+
+
+def mark_context_reset(session_id: str, snapshot_dir: Optional[Path] = None) -> None:
+    """Record that this session's context was emptied now (/clear or compaction).
+
+    The re-fetch guard reads this to stop treating archived MCP results from
+    before the reset as data the model still holds. A plain timestamp file, not a
+    database row, because the guard runs on every MCP call and stays free of
+    SQLite. Best-effort: a failed write only means the guard keeps its old
+    behaviour.
+    """
+    try:
+        marker = _context_reset_marker(session_id, snapshot_dir)
+        if marker is None:
+            return
+        marker.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        marker.write_text(repr(time.time()), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def context_reset_at(session_id: str, snapshot_dir: Optional[Path] = None) -> float:
+    """Epoch seconds of the session's last context reset, or 0.0 if none."""
+    try:
+        marker = _context_reset_marker(session_id, snapshot_dir)
+        if marker is None:
+            return 0.0
+        return float(marker.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return 0.0
 
 
 def cleanup_old_stores(max_age_hours: int = CLEANUP_AGE_HOURS) -> int:

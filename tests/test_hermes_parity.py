@@ -7,9 +7,8 @@ the real engines in child processes against a throwaway home. A few use a
 recording stand-in for the bridge where only the plugin's own decisions are
 under test (which checkpoint, when).
 """
-
 from __future__ import annotations
-
+from helpers.measure_split import exec_source_module as _split_exec_module, measure_source as _split_measure_source
 import importlib.util
 import json
 import os
@@ -74,7 +73,7 @@ def _load_plugin(path: Path = HERMES_PAYLOAD / "__init__.py", name: str = "to_he
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
-    spec.loader.exec_module(module)
+    _split_exec_module(module)
     return module
 
 
@@ -83,6 +82,11 @@ def plugin(home):
     module = _load_plugin()
     # Deterministic host timeout: no Hermes config is importable here.
     module._hook_timeout_cache["value"] = 30.0
+    # These tests check what the hooks decide, not how fast: a loaded CI
+    # runner can take over 3 s to start the child process, and the hook then
+    # fails open. Timing has its own tests below.
+    module._PRE_TOOL_TIMEOUT_S = 12.0
+    module._POST_TOOL_TIMEOUT_S = 15.0
     yield module
     sys.modules.pop("to_hermes_parity_plugin", None)
 
@@ -251,7 +255,7 @@ def test_plugin_registers_every_declared_hook(plugin):
 
 def test_manifest_version_bumped_for_new_features():
     text = (HERMES_PAYLOAD / "plugin.yaml").read_text(encoding="utf-8")
-    assert re.search(r'^version:\s*"0\.2\.1"\s*$', text, re.MULTILINE)
+    assert re.search(r'^version:\s*"0\.2\.2"\s*$', text, re.MULTILINE)
 
 
 def test_register_survives_a_host_that_rejects_one_hook(plugin):
@@ -581,6 +585,18 @@ def test_compaction_clears_read_cache_and_restores_checkpoint(plugin, home, tmp_
     assert "Refactor the parser module" in ctx["context"]
 
 
+def test_session_reset_clears_read_cache_for_the_reused_id(plugin, home, tmp_path):
+    sid = "sess_reset_01"
+    _make_state_db(home, sid)
+    src = tmp_path / "keep.py"
+    src.write_text((SCRIPTS / "spawn_utils.py").read_text(encoding="utf-8"), encoding="utf-8")
+    assert _read(plugin, sid, src, "r1") is None
+    assert _read(plugin, sid, src, "r2")["action"] == "block"
+    plugin.on_session_reset(session_id=sid, platform="cli", reason="new")
+    # /new emptied the model's context: the next read is served in full.
+    assert _read(plugin, sid, src, "r3") is None
+
+
 def test_rotated_session_restores_from_the_old_session(plugin, home):
     old, new = "sess_rot_old1", "sess_rot_new1"
     _make_state_db(home, old)
@@ -655,7 +671,7 @@ def test_skill_loads_are_counted_and_sent_with_the_rollup(plugin, recorder):
 
 
 def test_rollup_skill_argument_is_validated():
-    src = (SCRIPTS / "measure.py").read_text(encoding="utf-8")
+    src = _split_measure_source(SCRIPTS / "measure.py")
     start = src.index("_HERMES_SKILLS_MAX = 200")
     end = src.index("def _parse_hermes_rollup_context(args):")
     ns: dict = {"json": json}
@@ -909,7 +925,7 @@ def test_hermes_messages_translate_to_checkpoint_records():
 
 
 def _measure_constant(name: str):
-    text = (SCRIPTS / "measure.py").read_text(encoding="utf-8")
+    text = _split_measure_source(SCRIPTS / "measure.py")
     m = re.search(rf"^{name} = (.+)$", text, re.MULTILINE)
     assert m, name
     raw = m.group(1)

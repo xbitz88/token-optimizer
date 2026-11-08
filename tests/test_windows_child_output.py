@@ -5,11 +5,13 @@ output went to a hidden console or NULL handles. The fix hands it the parent's s
 through the same guard hooks/run.py uses. Not provable without Windows: these tests pin
 the arguments given to subprocess.
 """
+from helpers.measure_split import exec_source_module as _split_exec_module, measure_source as _split_measure_source
 
 import importlib.util
 import io
 import os
 import subprocess
+import time
 import sys
 from pathlib import Path
 
@@ -25,7 +27,7 @@ def _load_measure():
         sys.path.insert(0, scripts)
     spec = importlib.util.spec_from_file_location("measure_r3d_under_test", MEASURE_PATH)
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    _split_exec_module(module)
     return module
 
 
@@ -126,14 +128,14 @@ def _cli_source_block(measure_src, command):
 
 @pytest.mark.parametrize("command", ["read-cache-clear", "read-cache-stats"])
 def test_cli_branches_use_the_shared_child_launcher(command):
-    src = MEASURE_PATH.read_text(encoding="utf-8")
+    src = _split_measure_source(MEASURE_PATH)
     block = _cli_source_block(src, command)
     assert "_run_script_child(" in block, block
     assert "subprocess.run(" not in block, block
 
 
 def test_structure_proof_branch_uses_the_shared_child_launcher():
-    src = MEASURE_PATH.read_text(encoding="utf-8")
+    src = _split_measure_source(MEASURE_PATH)
     start = src.index('elif args[0] == "structure-proof":')
     block = src[start:src.index("    else:\n        print(\"Usage:\")", start)]
     assert "_run_script_child(" in block, block
@@ -150,9 +152,26 @@ def test_read_cache_stats_still_prints_on_this_platform(tmp_path):
     env["CLAUDE_CONFIG_DIR"] = str(home / ".claude")
     env["TOKEN_OPTIMIZER_SNAPSHOT_DIR"] = str(tmp_path / "snap")
     env["PYTHONUTF8"] = "1"
+    started = time.monotonic()
     proc = subprocess.run(
         [sys.executable, str(MEASURE_PATH), "read-cache-stats", "--session", "r3d-test"],
         capture_output=True, text=True, timeout=60, env=env, cwd=str(tmp_path),
     )
-    assert proc.returncode == 0, proc.stderr
+    cli_s = round(time.monotonic() - started, 2)
+
+    def diagnostics():
+        # Failure-only. The product keeps its own 5s child bound; this only times the same child run
+        # directly with a longer limit, so a log can tell "slow cold start" from "hung".
+        probe = ""
+        try:
+            t0 = time.monotonic()
+            direct = subprocess.run(
+                [sys.executable, str(MEASURE_PATH.parent / "read_cache.py"), "--stats", "--session", "r3d-test"],
+                capture_output=True, text=True, timeout=30, env=env, cwd=str(tmp_path))
+            probe = "direct read_cache --stats: rc=%s elapsed_s=%s" % (direct.returncode, round(time.monotonic() - t0, 2))
+        except Exception as exc:  # noqa: BLE001 - diagnostics must never mask the real failure
+            probe = "direct probe failed: %s" % type(exc).__name__
+        return "cli_elapsed_s=%s rc=%s; %s; stderr_tail=%r" % (cli_s, proc.returncode, probe, proc.stderr[-300:])
+
+    assert proc.returncode == 0, diagnostics() + "\nstderr: " + proc.stderr  # message is lazy: built only on failure
     assert (proc.stdout + proc.stderr).strip(), "read-cache-stats printed nothing"

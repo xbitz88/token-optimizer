@@ -15,12 +15,11 @@
 #
 # Copyright (C) 2026 Alex Greenshpun
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-
 set -euo pipefail
-
 GITHUB_REPO="alexgreensh/token-optimizer"
 REPO_HTTPS="https://github.com/${GITHUB_REPO}.git"
 REPO_SSH="git@github.com:${GITHUB_REPO}.git"
+SPARSE_CONE_DIRS="skills/ hooks/ devin/ .claude-plugin/ .codex-plugin/ .codex/"  # new clones only: Claude payload dirs; cone mode also materializes root files
 # Honor a relocated Claude home (matches runtime_env.py:380-402 which reads
 # CLAUDE_CONFIG_DIR). OpenCode users without Claude Code, or anyone pointing
 # Claude at a non-default home, get the skill tree installed in the right
@@ -36,9 +35,7 @@ INSTALL_OLD_HEAD=""
 INSTALL_UPDATED=0
 VERIFIED_RELEASE_HEAD=""
 trap 'rm -rf "$TMP_DIR"' EXIT
-
 # ── Colors ────────────────────────────────────────────────────
-
 if [ -t 1 ]; then
     GREEN='\033[0;32m'
     YELLOW='\033[0;33m'
@@ -48,11 +45,9 @@ if [ -t 1 ]; then
 else
     GREEN='' YELLOW='' RED='' BOLD='' NC=''
 fi
-
 info()  { printf "${GREEN}>${NC} %s\n" "$1"; }
 warn()  { printf "${YELLOW}!${NC} %s\n" "$1"; }
 fail()  { printf "${RED}x${NC} %s\n" "$1"; exit 1; }
-
 # Materialize sparse-checkout paths from the commit this checkout is AT, never
 # from a moving branch. A `git pull` here would let a moved/compromised
 # upstream deliver arbitrary code into the plugin dir, executed on every hook.
@@ -71,14 +66,12 @@ _materialize_from_pin() {
         git -C "$script_dir" checkout "$pin_sha" -- "$@" 2>/dev/null || true
     fi
 }
-
 # ── OpenCode local-dir install (no npm) ───────────────────────
 # `install.sh --opencode` builds the TypeScript plugin and drops a single
 # bundled file into ~/.config/opencode/plugins/, which OpenCode auto-loads
 # at startup. This is the offline / no-npm fallback to:
 #     opencode plugin token-optimizer-opencode
 # It needs bun (OpenCode's own runtime) and a checkout of this repo.
-
 install_opencode() {
     command -v bun &>/dev/null || fail "bun not found. OpenCode runs on bun; install it first: https://bun.sh"
 
@@ -1240,10 +1233,17 @@ rollback_install_update() {
         local attempted_head
         attempted_head=$(git -C "$INSTALL_DIR" rev-parse HEAD 2>/dev/null || echo "unknown")
         warn "Rolling back unverified update from ${attempted_head} to ${INSTALL_OLD_HEAD}"
-        if git -C "$INSTALL_DIR" reset --hard "$INSTALL_OLD_HEAD" >/dev/null 2>&1; then
+        if git -C "$INSTALL_DIR" checkout --no-overwrite-ignore --detach "$INSTALL_OLD_HEAD" >/dev/null 2>&1; then
+            # Re-attach HEAD to the exact ref it started on so SKIP_VERIFY can pull again. Ref-only; only a
+            # refs/heads/ branch this update moved is moved back (compare-and-swap); other refs are never moved.
+            local r="${INSTALL_OLD_HEAD_REF:-}" now tip
+            if [ -n "$r" ] && now=$(git -C "$INSTALL_DIR" rev-parse HEAD 2>/dev/null) && tip=$(git -C "$INSTALL_DIR" rev-parse -q --verify "${r}^{commit}" 2>/dev/null) &&
+               { [ "$tip" = "$now" ] || { case "$r" in refs/heads/*) [ "$tip" = "$attempted_head" ] && git -C "$INSTALL_DIR" update-ref -m "token-optimizer rollback" "$r" "$now" "$tip" 2>/dev/null;; *) false;; esac; }; }; then
+                git -C "$INSTALL_DIR" symbolic-ref HEAD "$r" 2>/dev/null || true
+            fi
             info "Rollback succeeded"
         else
-            warn "Rollback failed. Re-clone from: https://github.com/${GITHUB_REPO}"
+            warn "Rollback refused or failed; local edits were not discarded. Inspect: git -C \"${INSTALL_DIR}\" status. After saving local work, retry: git -C \"${INSTALL_DIR}\" checkout --no-overwrite-ignore --detach \"${INSTALL_OLD_HEAD}\""
         fi
     fi
 }
@@ -1284,6 +1284,13 @@ verify_skill_payload() {
     [ -f "$skill_md" ] || return 1
     [ -f "$measure_py" ] || return 1
 
+    # An intact facade cannot run without every eager provider.
+    local module
+    for module in __init__ _compat runtime pricing audit dashboard lifecycle sessions \
+                  trends cache_policy daemon quality_archive continuity savings cli; do
+        [ -f "${skill_root}/scripts/_measure/${module}.py" ] || return 1
+    done
+
     # Derive the references/*.md files SKILL.md actually references and verify
     # each one is present. sort -u dedups; the while loop reads one path per line.
     local ref
@@ -1304,14 +1311,12 @@ repair_and_verify_skill_payload() {
         return 0
     fi
     warn "Incomplete skill payload detected (missing referenced files). Repairing sparse checkout..."
-    git -C "$INSTALL_DIR" sparse-checkout set \
-        skills/ hooks/ devin/ .claude-plugin/ .codex-plugin/ .codex/ \
-        2>/dev/null || git -C "$INSTALL_DIR" sparse-checkout disable 2>/dev/null || true
+    git -C "$INSTALL_DIR" sparse-checkout disable 2>/dev/null || true
     if verify_skill_payload; then
         info "Skill payload restored"
         return 0
     fi
-    warn "Sparse checkout set did not restore skill payload. Disabling sparse checkout..."
+    warn "Full checkout did not restore skill payload. Retrying..."
     git -C "$INSTALL_DIR" sparse-checkout disable 2>/dev/null || true
     if verify_skill_payload; then
         info "Skill payload restored (sparse checkout disabled)"
@@ -1370,9 +1375,8 @@ verify_release_candidate_before_live_update() {
     rm -rf "$candidate_dir"
     git clone --depth 1 --filter=blob:none --sparse --branch "$RELEASE_TAG" \
         "$candidate_url" "$candidate_dir" >/dev/null 2>&1 || return 1
-    git -C "$candidate_dir" sparse-checkout set \
-        skills/ hooks/ devin/ .claude-plugin/ .codex-plugin/ .codex/ \
-        >/dev/null 2>&1 || return 1
+    git -C "$candidate_dir" sparse-checkout init --cone >/dev/null 2>&1 || return 1
+    git -C "$candidate_dir" sparse-checkout set $SPARSE_CONE_DIRS >/dev/null 2>&1 || return 1
     verify_checksums_in_dir "$candidate_dir" || return 1
     VERIFIED_RELEASE_HEAD=$(git -C "$candidate_dir" rev-parse HEAD 2>/dev/null || echo "")
     [ -n "$VERIFIED_RELEASE_HEAD" ]
@@ -1408,10 +1412,11 @@ clone_repo() {
         else
             git clone --depth 1 --filter=blob:none --sparse "$url" "$INSTALL_DIR" 2>"$clone_log" || return 1
         fi
-        # Cone mode only accepts directories; root-level files are included automatically
-        git -C "$INSTALL_DIR" sparse-checkout set \
-            skills/ hooks/ devin/ .claude-plugin/ .codex-plugin/ .codex/ \
-            2>>"$clone_log" || return 1
+        # Root files are included only when cone mode is actually on. git
+        # before cone-by-default (observed: 2.34.1) keeps cone OFF, drops root
+        # files, and the checksum manifest then fails every verified install.
+        git -C "$INSTALL_DIR" sparse-checkout init --cone 2>>"$clone_log" || return 1
+        git -C "$INSTALL_DIR" sparse-checkout set $SPARSE_CONE_DIRS 2>>"$clone_log" || return 1
     }
 
     if try_clone "$REPO_HTTPS"; then
@@ -1477,29 +1482,22 @@ update_repo() {
 if [ -d "${INSTALL_DIR}/.git" ]; then
     info "Existing install found. Updating..."
     INSTALL_OLD_HEAD=$(git -C "$INSTALL_DIR" rev-parse HEAD 2>/dev/null || true)
+    INSTALL_OLD_HEAD_REF=$(git -C "$INSTALL_DIR" symbolic-ref -q HEAD 2>/dev/null || true)  # full ref, e.g. refs/heads/main
 
-    # Enable sparse checkout on existing installs (migrates full clones)
-    if ! git -C "$INSTALL_DIR" sparse-checkout list &>/dev/null || \
-       git -C "$INSTALL_DIR" sparse-checkout list 2>/dev/null | grep -q "^/$"; then
-        info "Migrating to sparse checkout (removing OpenClaw files)..."
-        git -C "$INSTALL_DIR" sparse-checkout init --cone 2>/dev/null || true
-        # Cone mode only accepts directories; root-level files are included automatically
-        git -C "$INSTALL_DIR" sparse-checkout set \
-            skills/ hooks/ devin/ .claude-plugin/ .codex-plugin/ .codex/ \
-            2>/dev/null || true
+    # Never narrow a live checkout: Git may delete ignored data in an extra
+    # selected folder. Legacy non-cone patterns cannot be safely translated.
+    if [ "$(git -C "$INSTALL_DIR" config --bool core.sparseCheckout 2>/dev/null)" = "true" ] &&
+       [ "$(git -C "$INSTALL_DIR" config --bool core.sparseCheckoutCone 2>/dev/null)" != "true" ]; then
+        info "Restoring full checkout without narrowing legacy selected folders..."
+        git -C "$INSTALL_DIR" sparse-checkout disable 2>/dev/null ||
+            fail_verified_install "Could not safely restore legacy sparse checkout. No update attempted. Inspect: git -C ${INSTALL_DIR} status"
     fi
 
     # Self-heal: v5.7.5-5.7.9 had a sparse-checkout bug that pruned skills/ and hooks/.
     # If they're missing after update, fix the sparse checkout config.
     if [ ! -d "${INSTALL_DIR}/skills" ] || [ ! -d "${INSTALL_DIR}/hooks" ]; then
         warn "Broken sparse checkout detected (skills/ or hooks/ missing). Repairing..."
-        git -C "$INSTALL_DIR" sparse-checkout set \
-            skills/ hooks/ devin/ .claude-plugin/ .codex-plugin/ .codex/ \
-            2>/dev/null || git -C "$INSTALL_DIR" sparse-checkout disable 2>/dev/null || true
-        if [ ! -d "${INSTALL_DIR}/skills" ]; then
-            warn "Sparse checkout repair failed. Disabling sparse checkout..."
-            git -C "$INSTALL_DIR" sparse-checkout disable 2>/dev/null || true
-        fi
+        git -C "$INSTALL_DIR" sparse-checkout disable 2>/dev/null || true
         if [ -d "${INSTALL_DIR}/skills" ]; then
             info "Sparse checkout repaired"
         else
@@ -1512,13 +1510,7 @@ if [ -d "${INSTALL_DIR}/.git" ]; then
     # A release checkout can change sparse checkout behavior. Repair again after update.
     if [ ! -d "${INSTALL_DIR}/skills" ] || [ ! -d "${INSTALL_DIR}/hooks" ]; then
         warn "Broken sparse checkout detected after update. Repairing..."
-        git -C "$INSTALL_DIR" sparse-checkout set \
-            skills/ hooks/ devin/ .claude-plugin/ .codex-plugin/ .codex/ \
-            2>/dev/null || git -C "$INSTALL_DIR" sparse-checkout disable 2>/dev/null || true
-        if [ ! -d "${INSTALL_DIR}/skills" ]; then
-            warn "Sparse checkout repair failed. Disabling sparse checkout..."
-            git -C "$INSTALL_DIR" sparse-checkout disable 2>/dev/null || true
-        fi
+        git -C "$INSTALL_DIR" sparse-checkout disable 2>/dev/null || true
         [ -d "${INSTALL_DIR}/skills" ] || fail_verified_install "Could not restore skills/ directory. Try re-cloning from: https://github.com/${GITHUB_REPO}"
         # Verify the skill payload (not just the directory) after the dir repair.
         repair_and_verify_skill_payload
