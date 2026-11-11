@@ -1,6 +1,6 @@
 """Definition-only implementations; mutable state belongs to measure."""
 from __future__ import annotations
-from . import _compat, dashboard_history
+from . import _compat, coverage_report, dashboard_history, feature_health, holdout_report, structural_ledger, archive_health
 
 def _daemon_is_running():
     """Return True iff the dashboard daemon identity probe passes.
@@ -710,28 +710,28 @@ def generate_dashboard(coord_path):
     print("  Analyzing context quality...")
     quality = _measure_facade._collect_quality_for_dashboard()
 
-    # Collect hook installation status for dashboard toggles
     hook_status = _measure_facade._collect_hook_status_for_dashboard()
 
-    # Collect management data for Manage tab. The full audit dashboard should
-    # expose the same Codex skill/MCP controls as the standalone dashboard.
     management = _measure_facade._collect_management_data(components=components, trends=trends)
 
-    # Savings data for dashboard. Merged view = measured runtime + realized
-    # structural + opportunity (unclaimed) + estimated uncaptured runtime, all
-    # tier-labelled. Wrapped so a slow/failed savings eval never blocks regen.
     print("  Collecting savings data...")
     savings_data = _measure_facade._dashboard_savings_data(days=30)
 
-    # U6: tiered compression-coverage diagnostic (kept separate from savings;
-    # shadow/opportunity ratios never feed the headline). Fail-open to empty.
+    # Savings-truth U6: lean-resume carry is a SHADOW diagnostic. It is emitted
+    # for review only and is never summed into any savings total.
+    try:
+        import lean_resume_carry as _lean_resume_carry
+        if isinstance(savings_data, dict):
+            savings_data["lean_resume_carry"] = _lean_resume_carry.summary(days=30)
+    except Exception:
+        if isinstance(savings_data, dict):
+            savings_data["lean_resume_carry"] = {"available": False, "evidence": "shadow"}
+
     try:
         compression_coverage = _measure_facade._get_compression_coverage(days=30)
     except Exception:
         compression_coverage = {"available": False, "tiers": {}, "first_read_proxy": None}
 
-    # Tripwire verdict for the coverage panel (per-cohort live edit-rate +
-    # auto-demotions). Read-only; never recomputes/demotes here. Fail-open.
     try:
         cohort_tripwire = _measure_facade._cohort_tripwire_state()
     except Exception:
@@ -770,7 +770,7 @@ def generate_dashboard(coord_path):
     # when the meter has never been read at all (a stale-but-present reading is
     # kept and dated on the card), and the template simply omits the card.
     try:
-        runway = _measure_facade.runway_snapshot(days=30)
+        runway = _measure_facade.runway_snapshot(days=30, token_headline=savings_data.get("token_headline"))
     except Exception:
         runway = None
 
@@ -789,6 +789,9 @@ def generate_dashboard(coord_path):
         "savings": savings_data,
         "compression_coverage": compression_coverage,
         "cache_health": cache_health,
+        "feature_health": feature_health.collect(_measure_facade.TRENDS_DB),
+        "coverage_funnel": coverage_report.collect(_measure_facade.TRENDS_DB),
+        "holdout": holdout_report.collect(_measure_facade.TRENDS_DB),
         "auto_plan": auto_plan_flag,
         "generated_at": _measure_facade.datetime.now().isoformat(),
         "version": _measure_facade.TOKEN_OPTIMIZER_VERSION,
@@ -800,6 +803,11 @@ def generate_dashboard(coord_path):
 
     # Load template and inject data
     template = template_path.read_text(encoding="utf-8")
+    try:  # U9: inline renderer modules kept beside the template (fail-open)
+        import dashboard_assets as _dashboard_assets
+        template = _dashboard_assets.inline(template, template_path.parent)
+    except Exception:
+        pass
     data_json = _measure_facade.json.dumps(data, ensure_ascii=True, default=str)
     data_json = data_json.replace("</", "<\\/")  # Prevent </script> injection
     placeholder = "window.__TOKEN_DATA__ = null;"
@@ -2032,6 +2040,7 @@ def plugin_cleanup(dry_run=None, quiet=None):
                         shutil.move(str(item), str(dest))
                     if not quiet:
                         print(f"    archived: {item.name} -> {archive_dir.name}/")
+                    structural_ledger.record_skill_action("archive", item.name, dest)
                     actions_taken.append(f"archived duplicate local skill: {item.name}")
                 except OSError as e:
                     if not quiet:
@@ -2117,6 +2126,7 @@ def _manage_skill_locked(action, name):
         except OSError as e:
             print(f"  [!] Failed to archive '{name}': {e}")
             return False
+        structural_ledger.record_skill_action("archive", name, dst)
         print(f"  Archived: {name} -> {archive_dir.name}/")
         return True
 
@@ -2160,6 +2170,7 @@ def _manage_skill_locked(action, name):
                 except OSError as e:
                     print(f"  [!] Failed to restore '{name}': {e}")
                     return False
+                structural_ledger.record_skill_action("restore", name, dst)
                 print(f"  Restored: {name} from {ad.name}/")
                 # Clean up empty archive dir
                 try:
@@ -2507,7 +2518,7 @@ def generate_standalone_dashboard(days=None, quiet=None, force=None):
     # setups or when the meter has never been read (a stale-but-present reading is
     # kept and dated on the card), and the template omits the card.
     try:
-        runway = _measure_facade.runway_snapshot(days=30)
+        runway = _measure_facade.runway_snapshot(days=30, token_headline=savings_data.get("token_headline"))
     except Exception:
         runway = None
 
@@ -2523,7 +2534,11 @@ def generate_standalone_dashboard(days=None, quiet=None, force=None):
         "manage": management,
         "hooks": hook_status,
         "savings": savings_data,
+        "archive_replacement_check": archive_health.replacement_check(_measure_facade),
         "cache_health": cache_health,
+        "feature_health": feature_health.collect(_measure_facade.TRENDS_DB),
+        "coverage_funnel": coverage_report.collect(_measure_facade.TRENDS_DB),
+        "holdout": holdout_report.collect(_measure_facade.TRENDS_DB),
         "standalone": True,
         "auto_plan": True,
         "generated_at": _measure_facade.datetime.now().isoformat(),
@@ -2542,6 +2557,11 @@ def generate_standalone_dashboard(days=None, quiet=None, force=None):
     data = _measure_facade._sanitize_dashboard_paths(data)
 
     template = template_path.read_text(encoding="utf-8")
+    try:  # U9: inline renderer modules kept beside the template (fail-open)
+        import dashboard_assets as _dashboard_assets
+        template = _dashboard_assets.inline(template, template_path.parent)
+    except Exception:
+        pass
     data_json = _measure_facade.json.dumps(data, ensure_ascii=True, default=str)
     data_json = data_json.replace("</", "<\\/")  # Prevent </script> injection
     placeholder = "window.__TOKEN_DATA__ = null;"
@@ -3045,12 +3065,9 @@ def _query_trends_db(conn, days):
                 "jsonl_path": jsonl_path,
                 "topic": sr["topic"],
                 "project": _measure_facade._clean_project_name(sr["project"]),
-                # cost_usd is THIS day's share; session_cost_usd is the whole session.
                 "cost_usd": round(day_cost, 4),
                 "session_cost_usd": round(session_total_cost, 4),
-                # input/output_tokens above are whole-session totals (the row
-                # describes the session); these are this day's share, the same
-                # numbers the day's total_input/total_output add up.
+                # These token counts cover this day, not the whole session.
                 "day_input_tokens": day_in,
                 "day_output_tokens": day_out,
                 "spans_days": len(du) > 1,
@@ -3060,16 +3077,21 @@ def _query_trends_db(conn, days):
                 "model": _measure_facade._normalize_model_name(dom_model) or dom_model,
                 "model_count": len(mu) if mu else 1,
             }
-            # Prefer stored quality score (persisted during collect), fall back to recomputation
-            if sr["quality_score"] is not None:
-                sd["quality_score"] = sr["quality_score"]
-                sd["quality_grade"] = sr["quality_grade"] or _measure_facade.score_to_grade(round(sr["quality_score"]))
-                sd["quality_band"] = _measure_facade.score_to_band(sr["quality_score"])
+            # Legacy session_log quality fields have no score version.
+            try:
+                qc = _measure_facade._read_quality_cache(_measure_facade._quality_cache_path_for(_measure_facade.Path(jsonl_path))) or {}
+            except (OSError, ValueError, TypeError):
+                qc = {}
+            if qc.get("score_version") == _measure_facade._QUALITY_SCORE_VERSION and qc.get("session_file") == _measure_facade.Path(jsonl_path).name:
+                sd["quality_score"] = qc.get("score")
+                sd["quality_grade"] = qc.get("grade", "?")
+                sd["quality_measured"] = qc.get("measured", False)
+                sd["quality_band"] = _measure_facade.score_to_band(qc["score"]) if sd["quality_measured"] else "Unmeasured"
             else:
-                sq = _measure_facade.score_session_quality(sd)
-                sd["quality_score"] = sq["score"]
-                sd["quality_grade"] = sq["grade"]
-                sd["quality_band"] = sq["band"]
+                sd["quality_score"] = None
+                sd["quality_grade"] = "?"
+                sd["quality_measured"] = False
+                sd["quality_band"] = "Unmeasured"
             d["session_details"].append(sd)
         if window_unpriced > 0:
             total_unpriced_sessions += 1
@@ -3081,14 +3103,13 @@ def _query_trends_db(conn, days):
         d["total_cost_usd"] = round(sum(float(sd.get("cost_usd") or 0.0) for sd in details), 4)
         d["cost_priced_tokens"] = sum(int(sd.get("cost_priced_tokens") or 0) for sd in details)
         d["cost_unpriced_tokens"] = sum(int(sd.get("cost_unpriced_tokens") or 0) for sd in details)
-        scores = [float(sd["quality_score"]) for sd in details if sd.get("quality_score") is not None]
+        scores = [float(sd["quality_score"]) for sd in details if sd.get("quality_measured") and sd.get("quality_score") is not None]
         if scores:
             d["avg_quality_score"] = round(sum(scores) / len(scores), 1)
-        grades = [sd.get("quality_grade") for sd in details if sd.get("quality_grade")]
+        grades = [sd.get("quality_grade") for sd in details if sd.get("quality_measured") and sd.get("quality_grade")]
         if grades:
             d["worst_grade"] = min(grades, key=lambda grade: ((_measure_facade := _compat.facade()), grade_rank.get(grade, 999))[1])
 
-    # Rolling quality trend from session_log
     quality_trend_rows = conn.execute(
         """SELECT date,
                   AVG(quality_score) as avg_q,
@@ -3096,7 +3117,7 @@ def _query_trends_db(conn, days):
                   MAX(quality_score) as max_q,
                   COUNT(*) as n
            FROM session_log
-           WHERE date >= ? AND quality_score IS NOT NULL
+           WHERE date >= ? AND quality_score IS NOT NULL AND quality_grade != '?'
            GROUP BY date ORDER BY date""",
         (cutoff,),
     ).fetchall()
@@ -3111,8 +3132,6 @@ def _query_trends_db(conn, days):
         for r in quality_trend_rows
     ]
 
-    # conn.close() removed — caller (_collect_trends_from_db) owns the connection
-    # and closes it in its finally block (double-close fix).
 
     # Pricing tier info for dashboard
     pricing_tier = _measure_facade._load_pricing_tier()
@@ -3340,13 +3359,19 @@ def _collect_git_commits(days=None):
 def _collect_trends_data(days=None):
     """Collect trends data, preferring SQLite DB when available.
 
-    Falls back to live JSONL parsing if DB doesn't exist or is empty.
-    """
+    Falls back to live JSONL parsing if DB doesn't exist or is empty."""
     # Try SQLite first (faster, accumulated data)
     _measure_facade = _compat.facade()
     result = _measure_facade._collect_trends_from_db(days)
     if result is not None:
-        result["git_commits"] = _measure_facade._collect_git_commits(days)
+        from . import first_call_context; result["first_call_context"] = first_call_context.collect(_measure_facade.TRENDS_DB, _measure_facade.SNAPSHOT_DIR); result["git_commits"] = _measure_facade._collect_git_commits(days)
+        try:
+            from . import setup_step, structural_value
+            result["first_call_context"] = {**result["first_call_context"], "setup_steps": setup_step.collect(
+                _measure_facade.TRENDS_DB, _measure_facade.SNAPSHOT_DIR, _measure_facade.CLAUDE_DIR,
+                structural_value.card_resolver(_measure_facade))}
+        except Exception:
+            pass  # the card renders without the measured steps
         return result
     # Fall back to live JSONL parsing
     result = _measure_facade._collect_trends_from_jsonl(days)
@@ -3358,7 +3383,7 @@ def _collect_trends_data(days=None):
 def _build_ttl_period_summary(period_days):
     """Build a compact TTL mix summary for a given period."""
     _measure_facade = _compat.facade()
-    trends = _measure_facade._collect_trends_data(days=period_days)
+    from . import ttl_period; trends = ttl_period.base_trends(_measure_facade, period_days)
     if not trends:
         return {
             "label": f"{period_days}d: no cache-write data",
@@ -3547,6 +3572,8 @@ def _realized_savings_buckets(conn, cutoff, session_uuid=None, by_day=None):
         params.extend([session_uuid, session_uuid])
     se_sql = _measure_facade._BUCKET_SAVINGS_SQL[
         _measure_facade._counted_table(conn, "savings_events"), bool(by_day), session_uuid is not None]
+    se_table = _measure_facade._counted_table(conn, "savings_events")
+    if "detail" not in {r[1] for r in conn.execute(f"PRAGMA table_info({se_table})")}: se_sql = se_sql.replace(_measure_facade._counted_cap.reexpand_type(), "event_type")
     ce_sql = _measure_facade._BUCKET_COMPRESSION_SQL[
         _measure_facade._counted_table(conn, "compression_events"), bool(by_day), session_uuid is not None]
     se_rows = conn.execute(se_sql, tuple(params)).fetchall()
@@ -3605,13 +3632,13 @@ def _open_trends_db_readonly(timeout=None):
 
 
 def _dashboard_saved_tokens(summary):
-    """The dashboard's Tokens Saved headline: measured plus the estimated tier.
-
-    Mirrors tokensSavedCardHtml in assets/dashboard.html exactly (same fields,
-    same `a || b` fallbacks), so the status bar and the dashboard never disagree.
-    """
+    """Return the dashboard token total and its measured floor."""
     _measure_facade = _compat.facade()
     s = summary or {}
+
+    if isinstance(s.get("action_savings"), dict) and isinstance(s.get("token_headline"), dict):
+        from . import savings_story
+        return savings_story.story_token_total(s), max(0, int(s.get("total_tokens") or 0))
 
     def num(v):
         _measure_facade = _compat.facade()
@@ -3627,14 +3654,8 @@ def _dashboard_saved_tokens(summary):
         except AttributeError:
             return 0
 
-    estimated = (tok(s.get("mcp_cap_estimated"))
-                 + tok(s.get("hint_followed") or s.get("hint_followed_estimated"))
-                 + tok(s.get("verbosity_steer") or s.get("verbosity_steer_estimated"))
-                 + tok(s.get("resume_lean_estimated"))
-                 + tok(s.get("checkpoint_restore_estimated")))
+    estimated = tok(s.get("hint_followed") or s.get("hint_followed_estimated"))
     measured = num(s.get("total_tokens", 0))
-    # The dashboard draws no Tokens Saved card only when nothing was measured
-    # AND nothing estimated exists -- estimates still surface on their own.
     return measured + estimated, measured
 
 
@@ -3649,9 +3670,8 @@ def _status_bar_savings_or_reason(session_id, _retried=None):
     try:
         conn = _measure_facade._open_trends_db_readonly()
         try:
-            # One read transaction: both bucket reads see the same committed rows (the
-            # 30-day headline below runs on its own connection, as the dashboard's does).
             conn.execute("BEGIN")
+            has_counted = bool(conn.execute("SELECT 1 FROM counted_reread LIMIT 1").fetchone())
             days = _measure_facade._realized_savings_buckets(conn, cutoff, by_day=True)
             window = _measure_facade._realized_savings_buckets(conn, cutoff).get("", {"tokens": 0})
             sess = _measure_facade._realized_savings_buckets(conn, "", session_uuid=session_id).get(
@@ -3684,11 +3704,13 @@ def _status_bar_savings_or_reason(session_id, _retried=None):
         daily.append({"date": d, "tokens": int(b.get("tokens", 0)),
                       "usd": float(b.get("usd", 0.0))})
     headline = _measure_facade._get_merged_savings(days=_measure_facade._STATUS_BAR_DAYS)
+    from . import headline as headline_module
+    counted = _measure_facade._counted_cumulative_summary(days=_measure_facade._STATUS_BAR_DAYS) if has_counted else {"available": False}
+    headline["counted_period"] = counted
+    headline["token_headline"] = headline_module.token_headline(headline)
+    _measure_facade._apply_counted_oneshot_pricing(headline, counted)
+    headline["action_savings"] = _measure_facade._action_savings_components(headline, counted)
     shown, measured = _measure_facade._dashboard_saved_tokens(headline)
-    # The headline pass fails open to zeros; when the window, netted the way the
-    # headline nets it, shows savings but the headline is zero, it failed: say so
-    # rather than cache a false 0. Single days are not compared, since a debit on
-    # one day can honestly cancel savings on another.
     if measured == 0 and int(window.get("tokens", 0)) > 0:
         return None, "savings database busy"
     return {
@@ -3754,11 +3776,8 @@ def _status_bar_read_cache(session_id):
 def _status_bar_start_refresh(session_id):
     """Start ONE detached `status-bar --sync` child. Returns True if started.
 
-    A lock file (O_EXCL) makes concurrent callers start at most one child; the
-    child removes it when done, and a lock older than 120 s counts as abandoned.
-    The lock holds a random owner token, passed to the child in the
-    TO_STATUS_BAR_LOCK_TOKEN environment variable; the child deletes the lock
-    only while it still holds that token.
+    A guarded marker holds an owner token and PID. The child adopts it before
+    computing and removes it only while it still owns that token.
     """
     _measure_facade = _compat.facade()
     token = _measure_facade._status_bar_acquire_lock(session_id)
@@ -3779,101 +3798,13 @@ def _status_bar_start_refresh(session_id):
 
 
 def _status_bar_acquire_lock(session_id):
-    """Take the session's refresh lock; its owner token, or None when it is held."""
-    _measure_facade = _compat.facade()
-    lock = _measure_facade._status_bar_lock_path(session_id)
-    token = _measure_facade.os.urandom(16).hex()
-    fd = None
-    try:
-        lock.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            fd = _measure_facade.os.open(str(lock), _measure_facade.os.O_CREAT | _measure_facade.os.O_EXCL | _measure_facade.os.O_WRONLY)
-        except FileExistsError:
-            if _measure_facade.time.time() - lock.stat().st_mtime < _measure_facade._STATUS_BAR_LOCK_STALE_S:
-                return None
-            # Take an abandoned lock over by renaming it aside. Rename is atomic,
-            # so when two callers race only one moves the file; the other gets
-            # FileNotFoundError and backs off instead of deleting the winner's lock.
-            quarantine = lock.with_name(
-                f"{lock.name}.{_measure_facade.os.getpid()}.{_measure_facade.time.time_ns()}.stale")
-            try:
-                _measure_facade.os.rename(str(lock), str(quarantine))
-            except OSError:
-                return None
-            try:
-                moved_fresh = (_measure_facade.time.time() - _measure_facade.os.stat(str(quarantine)).st_mtime
-                               < _measure_facade._STATUS_BAR_LOCK_STALE_S)
-            except OSError:
-                moved_fresh = False
-            if moved_fresh:
-                # Another caller replaced the stale lock between our check and the
-                # rename, so we moved its live lock. Put it back without
-                # overwriting anything (link fails if the name is taken) and back off.
-                _measure_facade._status_bar_put_back(quarantine, lock)
-                try:
-                    quarantine.unlink()
-                except OSError:
-                    pass
-                return None
-            try:
-                quarantine.unlink()
-            except OSError:
-                pass
-            try:
-                fd = _measure_facade.os.open(str(lock), _measure_facade.os.O_CREAT | _measure_facade.os.O_EXCL | _measure_facade.os.O_WRONLY)
-            except FileExistsError:
-                return None
-        written = _measure_facade.os.write(fd, token.encode("ascii"))
-        _measure_facade.os.close(fd)
-        fd = None
-        if written != len(token):
-            # A short write leaves a lock nobody can prove they own: remove ours now.
-            try:
-                lock.unlink()
-            except OSError:
-                pass
-            return None
-        return token
-    except OSError:
-        if fd is not None:
-            try:
-                _measure_facade.os.close(fd)
-            except OSError:
-                pass
-            try:
-                lock.unlink()
-            except OSError:
-                pass
-        return None
+    from . import status_bar_lock
+    return status_bar_lock.acquire(_compat.facade(), session_id)
 
 
 def _status_bar_release_lock(session_id, token):
-    """Delete the refresh lock only when it still holds `token`. Never raises.
-
-    The lock is moved aside first (one atomic rename) and only then checked, so a
-    lock another process created after ours is never deleted by mistake: when the
-    moved file is not ours it goes back, unless a newer lock already took its name.
-    """
-    _measure_facade = _compat.facade()
-    if not token:
-        return False
-    lock = _measure_facade._status_bar_lock_path(session_id)
-    aside = lock.with_name(f"{lock.name}.{_measure_facade.os.getpid()}.{_measure_facade.time.time_ns()}.release")
-    try:
-        _measure_facade.os.rename(str(lock), str(aside))
-    except OSError:
-        return False
-    try:
-        mine = aside.read_text(encoding="ascii", errors="replace").strip() == token
-    except OSError:
-        mine = False
-    if not mine:
-        _measure_facade._status_bar_put_back(aside, lock)
-    try:
-        aside.unlink()
-    except OSError:
-        pass
-    return mine
+    from . import status_bar_lock
+    return status_bar_lock.release(_compat.facade(), session_id, token)
 
 
 def _status_bar_put_back(aside, lock):
@@ -4336,6 +4267,10 @@ def _status_bar_cli(args):
     child = sync and "--release-lock" in args
     sid = _measure_facade.sanitize_session_id(session)
     token = _measure_facade.os.environ.get(_measure_facade._STATUS_BAR_LOCK_TOKEN_ENV, "") if child else None
+    if child:
+        from . import status_bar_lock
+        if not status_bar_lock.adopt(_measure_facade, sid, token):
+            token, sync = None, False
     if sync and not child:
         # A direct --sync takes the same lock as the background refresh; when one is
         # already running, this answers from the cache instead of computing twice.
@@ -4382,3 +4317,4 @@ def _status_bar_finite(v):
     if isinstance(v, (list, tuple)):
         return [_measure_facade._status_bar_finite(x) for x in v]
     return v
+

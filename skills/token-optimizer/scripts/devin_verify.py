@@ -81,4 +81,10 @@ def payload_key_shapes(plugin, names, skill_md):
     before_both=expected-{search,urls}
     previous=before_both-{str(plugin/'devin_hooks.py'),tomli}
     legacy=previous-{str(plugin/name) for name in ('plugin_env.py','refetch_fingerprint.py')}
-    return expected,tuple(sorted(keys) for keys in (*variants,before_both-{tomli},previous,legacy))
+    shapes=(*variants,before_both-{tomli},previous,legacy)
+    # preserved_reinject.py (error-line re-inject) and post_run_classify.py (output
+    # classifier) joined the payload independently; an older record may lack either or both.
+    reinject=str(plugin/'preserved_reinject.py')
+    classify=str(plugin/'post_run_classify.py')
+    drops=({reinject},{classify},{reinject,classify})
+    return expected,tuple(sorted(keys) for keys in (*shapes,*(k-drop for drop in drops for k in shapes)))

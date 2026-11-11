@@ -14,8 +14,7 @@ PRIMARY KEY, legacy rows backfilled by a one-time ``rebuild``). A bounded
 
 Configuration:
   - WAL mode for concurrent read/write from separate hook processes
-  - busy_timeout=50ms: fail-fast under write contention (shadow mode
-    accepts dropped writes rather than stalling the hook process)
+  - busy_timeout=50ms: bound database waits; tracking events can be queued
   - synchronous=NORMAL (WAL-safe relaxation for performance)
   - 50MB cap per session DB
   - PreToolUse hooks: READ-ONLY queries only
@@ -28,11 +27,15 @@ import hashlib
 import json
 import re
 import sqlite3
+import sys
 import time
 import uuid
+import session_store_guard
+from _measure import session_store_spool
 from pathlib import Path
 from typing import Any, Optional
 
+from hint_paths import normalize_hint_path
 from plugin_env import resolve_snapshot_dir
 from reset_epoch import ResetEpochMixin, bump_reset_epoch
 
@@ -69,7 +72,7 @@ CREATE TABLE IF NOT EXISTS file_reads (
     last_structure_confidence REAL DEFAULT 0.0,
     last_tool_use_id TEXT DEFAULT ''
 );
-
+CREATE INDEX IF NOT EXISTS idx_file_reads_last_access ON file_reads(last_access DESC);
 CREATE TABLE IF NOT EXISTS tool_outputs (
     tool_use_id TEXT PRIMARY KEY,
     tool_name TEXT NOT NULL,
@@ -130,7 +133,7 @@ CREATE TABLE IF NOT EXISTS context_intel_events (
     output_chars INTEGER NOT NULL,
     timestamp REAL NOT NULL
 );
-
+CREATE INDEX IF NOT EXISTS idx_intel_timestamp ON context_intel_events(timestamp DESC); CREATE INDEX IF NOT EXISTS idx_intel_tool_use ON context_intel_events(tool_use_id);
 CREATE TABLE IF NOT EXISTS activity_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     tool_name TEXT NOT NULL,
@@ -220,29 +223,25 @@ class SessionStore(ResetEpochMixin):
         if self._conn is not None:
             return self._conn
         self._store_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        # Align the connect timeout (seconds) with the PRAGMA busy_timeout (ms)
-        # so the schema init AND later writes honor the same lock-wait budget.
         timeout_s = max(0.05, self._busy_timeout_ms / 1000.0)
-        self._conn = sqlite3.connect(str(self.db_path), timeout=timeout_s)
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute(f"PRAGMA busy_timeout={int(self._busy_timeout_ms)}")
-        self._conn.execute("PRAGMA synchronous=NORMAL")
-        # Defense-in-depth privacy (the parent dir is already 0700): the DB and
-        # its WAL/SHM sidecars hold cached tool output, so restrict them to the
-        # owner (0600). sqlite creates them honoring umask (commonly 0644), so
-        # tighten explicitly. Best-effort; never break a connect on chmod.
-        import os as _os
-        for _p in (
-            self.db_path,
-            self.db_path.with_suffix(".db-wal"),
-            self.db_path.with_suffix(".db-shm"),
-        ):
-            try:
-                _os.chmod(_p, 0o600)
-            except OSError:
-                pass
-        self._conn.row_factory = sqlite3.Row
-        self._init_schema()
+        self._conn = session_store_guard.connect(self, timeout_s)
+        try:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute(f"PRAGMA busy_timeout={int(self._busy_timeout_ms)}")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+            # The DB and its sidecars contain private cached output.
+            import os as _os
+            for _p in (self.db_path, self.db_path.with_suffix(".db-wal"),
+                       self.db_path.with_suffix(".db-shm")):
+                try:
+                    _os.chmod(_p, 0o600)
+                except OSError:
+                    pass
+            self._conn.row_factory = sqlite3.Row
+            self._init_schema()
+        except BaseException:
+            self.close()
+            raise
         return self._conn
 
     def _init_schema(self) -> None:
@@ -268,8 +267,6 @@ class SessionStore(ResetEpochMixin):
         # U6/fix-1: probe + setup the external-content FTS5 mirror (LIKE
         # fallback). Backfills legacy rows once, gated on prior_version < 2.
         self._ensure_fts5_index(conn, prior_version)
-        # Stamp the current schema version last (INSERT OR REPLACE so the bump
-        # actually lands on pre-existing DBs, not just brand-new ones).
         conn.execute(
             "INSERT OR REPLACE INTO session_meta (key, value) VALUES (?, ?)",
             ("_schema_version", str(_SCHEMA_VERSION)),
@@ -510,8 +507,9 @@ class SessionStore(ResetEpochMixin):
             try:
                 self._conn.close()
             except Exception:
-                pass
+                return
             self._conn = None
+            session_store_guard.release(self)
 
     _cap_warned = False
 
@@ -649,32 +647,14 @@ class SessionStore(ResetEpochMixin):
         output_text: Optional[str] = None,
         truncated: Optional[int] = None,
     ) -> None:
-        if self._is_over_size_cap():
-            return
         index_text, index_truncated = _bound_tool_output_index(output_text)
-        conn = self._connect()
-        conn.execute(
-            """INSERT OR IGNORE INTO tool_outputs
-               (tool_use_id, tool_name, tool_type, command_or_path,
-                output_hash, output_chars, output_tokens_est,
-                compressed_preview, timestamp,
-                source_file_path, language, archived_from, output_text,
-                truncated, index_truncated)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
+        session_store_spool.enqueue(self, {"kind": "tool_output", "values": (
                 tool_use_id, tool_name, tool_type, command_or_path,
                 output_hash, output_chars, output_tokens_est,
                 compressed_preview, time.time(),
                 source_file_path, language, archived_from, index_text,
                 truncated, index_truncated,
-            ),
-        )
-        # fix-1: the external-content FTS mirror is maintained by the AFTER
-        # INSERT trigger, which fires only when the INSERT OR IGNORE above
-        # actually writes a new row. No manual FTS write here -- that was the
-        # source of duplicate FTS rows on re-insert of the same tool_use_id.
-        conn.commit()
+            )})
 
     # ----- tool_outputs search (U6: FTS5 with LIKE fallback) -----
 
@@ -846,7 +826,7 @@ class SessionStore(ResetEpochMixin):
     def record_file_edit(self, file_path: str) -> None:
         """Keep edit evidence without persisting credential-shaped path text."""
         fingerprint = hashlib.sha256(file_path.encode("utf-8")).hexdigest()
-        self.set_meta("checkpoint_edit:" + fingerprint, "1")
+        session_store_spool.enqueue(self, {"kind": "file_edit", "fingerprint": fingerprint})
 
     def was_file_edited(self, file_path: str) -> bool:
         fingerprint = hashlib.sha256(file_path.encode("utf-8")).hexdigest()
@@ -861,16 +841,7 @@ class SessionStore(ResetEpochMixin):
         summary: str,
         output_chars: int,
     ) -> None:
-        if self._is_over_size_cap():
-            return
-        conn = self._connect()
-        conn.execute(
-            """INSERT INTO context_intel_events
-               (tool_name, tool_use_id, summary, output_chars, timestamp)
-               VALUES (?, ?, ?, ?, ?)""",
-            (tool_name, tool_use_id, summary, output_chars, time.time()),
-        )
-        conn.commit()
+        session_store_spool.enqueue_intel(self, tool_name, tool_use_id, summary, output_chars)
 
     def get_intel_events(self, limit: int = 20) -> list[dict[str, Any]]:
         conn = self._connect()
@@ -937,26 +908,17 @@ class SessionStore(ResetEpochMixin):
         """Record that a proactive prior-session hint surfaced these files to
         this session. A later read of one of them is observed evidence the hint
         spared an exploratory search (credited once via claim_hint_follow)."""
-        paths = [str(p).strip() for p in (file_paths or []) if str(p or "").strip()]
+        paths = [normalize_hint_path(p) for p in (file_paths or []) if str(p or "").strip()]
         if not paths:
             return
-        # Defensive cap independent of the call site (which already slices to ~5):
-        # a hint never legitimately surfaces dozens of files, so bound the write.
+        # Defensive cap, independent of the call site (which slices to ~5).
         paths = paths[:25]
-        conn = self._connect()
-        now = time.time()
-        conn.executemany(
-            """INSERT INTO hint_serves (file_path, served_at, credited)
-               VALUES (?, ?, 0)
-               ON CONFLICT(file_path) DO NOTHING""",
-            [(p, now) for p in paths],
-        )
-        conn.commit()
+        epoch = session_store_spool.hint_epoch(self)
+        session_store_spool.enqueue(self, {"kind": "hint_serves", "paths": paths, "timestamp": time.time(),
+                                           "reset_epoch": epoch})
 
-    # Only credit a hint follow when the read happens within this window of the
-    # hint being served. Beyond it, a read of the same file is more likely a
-    # coincidence than the hint doing its job -- keeps the avoided-search credit
-    # causally honest (and conservative).
+    # Credit a follow only within this window of the serve; later reads of the
+    # same file are more likely coincidence (keeps the credit conservative).
     HINT_FOLLOW_MAX_AGE_SECONDS = 4 * 60 * 60
 
     def claim_hint_follow(self, file_path: str, max_age_seconds: float = HINT_FOLLOW_MAX_AGE_SECONDS) -> bool:
@@ -972,17 +934,18 @@ class SessionStore(ResetEpochMixin):
             return False
         conn = self._connect()
         fresh_after = time.time() - max(0.0, max_age_seconds)
+        keys = (normalize_hint_path(file_path), str(file_path))  # raw: pre-normalization rows
         hit = conn.execute(
             "SELECT 1 FROM hint_serves "
-            "WHERE file_path = ? AND credited = 0 AND served_at >= ? LIMIT 1",
-            (str(file_path), fresh_after),
+            "WHERE file_path IN (?, ?) AND credited = 0 AND served_at >= ? LIMIT 1",
+            (*keys, fresh_after),
         ).fetchone()
         if not hit:
             return False
         cur = conn.execute(
             "UPDATE hint_serves SET credited = 1 "
-            "WHERE file_path = ? AND credited = 0 AND served_at >= ?",
-            (str(file_path), fresh_after),
+            "WHERE file_path IN (?, ?) AND credited = 0 AND served_at >= ?",
+            (*keys, fresh_after),
         )
         conn.commit()
         return cur.rowcount > 0
@@ -1024,10 +987,11 @@ def mark_context_reset(session_id: str, snapshot_dir: Optional[Path] = None) -> 
         marker = _context_reset_marker(session_id, snapshot_dir)
         if marker is None:
             return
-        marker.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        marker.write_text(repr(time.time()), encoding="utf-8")
-    except OSError:
-        pass
+        from _measure import context_reset_marker
+        if not context_reset_marker.publish(marker, time.time()):
+            print("[Session Store] Context reset marker not updated: lock busy", file=sys.stderr)
+    except OSError as exc:
+        print("[Session Store] Context reset marker not updated: " + str(exc), file=sys.stderr)
 
 
 def context_reset_at(session_id: str, snapshot_dir: Optional[Path] = None) -> float:
@@ -1043,18 +1007,4 @@ def context_reset_at(session_id: str, snapshot_dir: Optional[Path] = None) -> fl
 
 def cleanup_old_stores(max_age_hours: int = CLEANUP_AGE_HOURS) -> int:
     """Delete session store DBs older than max_age_hours. Returns count deleted."""
-    if not SESSION_STORE_DIR.exists():
-        return 0
-    cutoff = time.time() - (max_age_hours * 3600)
-    deleted = 0
-    for db_file in SESSION_STORE_DIR.glob("*.db"):
-        try:
-            if db_file.stat().st_mtime < cutoff:
-                db_file.unlink()
-                for wal in (db_file.with_suffix(".db-wal"), db_file.with_suffix(".db-shm")):
-                    if wal.exists():
-                        wal.unlink()
-                deleted += 1
-        except OSError:
-            pass
-    return deleted
+    return session_store_guard.prune_old_stores(SESSION_STORE_DIR, time.time() - max_age_hours * 3600)

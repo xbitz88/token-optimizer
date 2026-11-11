@@ -25,7 +25,8 @@ const tokensSavedCardHtml = () => '';
 const isCodex = false;
 const runtimeLabel = 'Claude Code';
 '''
-    script = prefix + body + '\nrenderSavings(); process.stdout.write(el.innerHTML);'
+    helper = html[html.index('function tokenSplitText('):html.index('function hostRefreshHtml(')]
+    script = prefix + helper + body + '\nrenderSavings(); process.stdout.write(el.innerHTML);'
     # Windows limits CreateProcess command lines to about 32 KiB. Send the
     # extracted renderer over stdin so the test exercises the real code there.
     result = subprocess.run(
@@ -54,10 +55,11 @@ def fixture():
 def test_action_hero_adds_rereads_once_and_keeps_other_logged_savings():
     html = render(fixture())
     actions = html.split('savings-actions')[1].split('savings-history')[0]
-    assert '$1,177' in actions  # 100 + 7 + 954 + 16 + 100, not +89 again
-    assert 'Logged actions <strong>$107' in actions
+    assert '$1,070' in actions  # 100 + 954 + 16; routing is disclosed apart
+    assert 'Logged actions <strong>$100' in actions
     assert 'Repeat reads avoided <strong>~$954' in actions
-    assert 'Other estimates <strong>~$116' in actions
+    assert 'Other estimates <strong>~$16' in actions
+    assert 'Model routing:' in actions and 'Not in this total' in actions
     assert 'smaller and exact' not in html
 
 
@@ -65,7 +67,7 @@ def test_action_hero_adds_rereads_once_and_keeps_other_logged_savings():
 def test_missing_or_empty_rereads_preserves_logged_floor(counted):
     s = fixture(); s['counted_period'] = counted
     actions = render(s).split('savings-actions')[1].split('savings-history')[0]
-    assert '$223' in actions
+    assert '$116' in actions
     assert '$2,613' not in actions  # never borrow lifetime value for an empty period
 
 
@@ -73,7 +75,7 @@ def test_young_install_uses_actual_totals_and_labels_estimates():
     s = fixture(); s['since_install']['days'] = 4
     actions = render(s).split('savings-actions')[1].split('savings-history')[0]
     assert '4 days tracked' in actions
-    assert '$1,177' in actions
+    assert '$1,070' in actions
     assert 'logged + estimated' in actions
     assert '/mo' not in actions
 
@@ -81,35 +83,10 @@ def test_young_install_uses_actual_totals_and_labels_estimates():
 def test_negative_reread_debits_are_not_clamped_away():
     s = fixture(); s['counted_period']['reread_usd'] = -23
     actions = render(s).split('savings-actions')[1].split('savings-history')[0]
-    assert '$200' in actions
+    assert '$93' in actions
 
 
-def test_transformation_percentage_matches_dollars_and_method_is_folded():
-    html = render(fixture())
-    card = html.split('savings-transformation')[1].split('savings-actions')[0]
-    assert '~13% lower cost' in card  # 2000 / 15000, not the 75% per-session gap
-    assert 'cheaper/session' not in card
-    assert 'last 30 days' in card
-    assert '<details class="fold"><summary>How this is estimated</summary>' in card
-    assert '<details open' not in card
-    visible = card.split('<details')[0]
-    assert len(re.sub('<[^>]+>', ' ', visible).split()) < 85
-
-
-def test_neutral_reprice_basis_is_disclosed_on_the_card():
-    s = fixture()
-    s['before_after']['compression_reprice_basis'] = 'routing_pending'
-    card = render(s).split('savings-transformation')[1].split('savings-actions')[0]
-    assert 'model-mix repricing is paused' in card.lower()
-    s['before_after']['compression_reprice_basis'] = 'routing_unavailable'
-    card = render(s).split('savings-transformation')[1].split('savings-actions')[0]
-    assert 'model-mix repricing could not be measured' in card.lower()
-    s['before_after']['compression_reprice_basis'] = 'routing_recipe'
-    card = render(s).split('savings-transformation')[1].split('savings-actions')[0]
-    assert 'model-mix repricing' not in card.lower()
-
-
-def test_capped_transformation_percentage_matches_the_capped_dollars():
+def test_transformation_dollars_do_not_replace_action_savings():
     s = fixture()
     s['before_after'].update({
         'monthly_savings_usd': 100,
@@ -120,10 +97,10 @@ def test_capped_transformation_percentage_matches_the_capped_dollars():
         'savings_capped': True,
         'savings_cap_note': 'Capped at actual spend; uncapped estimate was $900.',
     })
-    card = render(s).split('savings-transformation')[1].split('savings-actions')[0]
-    assert '~10% lower cost' in card
-    assert '~90% lower cost' not in card
-    assert 'Capped at actual spend; uncapped estimate was $900.' in card
+    html = render(s)
+    assert 'savings-transformation' not in html
+    assert 'savings-actions' in html
+    assert 'Capped at actual spend; uncapped estimate was $900.' not in html
 
 
 def test_history_compares_same_context_cohort_and_discloses_overlap():
@@ -136,16 +113,17 @@ def test_history_compares_same_context_cohort_and_discloses_overlap():
 def test_seven_day_card_does_not_project_thirty_day_value():
     s = fixture(); s['period_days'] = 7
     actions = render(s).split('savings-actions')[1].split('savings-history')[0]
-    assert '$1,177' in actions
+    assert '$1,070' in actions
     assert '$5,044' not in actions
     assert '7 days tracked' in actions
 
 
-def test_verbosity_estimate_is_included_once():
+def test_verbosity_estimate_is_excluded():
+    baseline = render(fixture()).split('savings-actions')[1].split('savings-history')[0]
     s = fixture(); s['verbosity_steer'] = {'cost_saved_usd': 10, 'events': 2}
+    s['verbosity_output_estimated'] = {'cost_saved_usd': 20, 'events': 2}
     actions = render(s).split('savings-actions')[1].split('savings-history')[0]
-    assert '$1,187' in actions
-    assert 'Other estimates <strong>~$126' in actions
+    assert actions == baseline
 
 
 def test_repeat_read_pricing_note_shows_once_beside_its_figure():
@@ -156,10 +134,10 @@ def test_repeat_read_pricing_note_shows_once_beside_its_figure():
     assert "cp.reread_pricing_note" in source
 
 
-def test_flat_transformation_shows_plain_no_change_card():
+def test_flat_transformation_does_not_replace_action_card():
     s = fixture()
     s['before_after'] = {'monthly_savings_usd': 0, 'reason': 'flat', 'transformation_state': 'flat',
                          'actual_monthly_usd': 27767.09, 'counterfactual_monthly_usd': 27820.04}
     html = render(s)
-    assert 'No measurable change in cost per unit of work' in html
-    assert 'disagree' not in html.lower()
+    assert 'savings-transformation' not in html
+    assert 'savings-actions' in html

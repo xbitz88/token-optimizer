@@ -1,34 +1,17 @@
 """Definition-only implementations; mutable state belongs to measure."""
 from __future__ import annotations
-from . import _compat
+from . import _compat, transcript_stream, checkpoint_direction, checkpoint_retention, upgrade_drain_control
 
 
 def _iter_tail_lines(filepath, tail_lines, chunk_size=None):
-    """Return the tail lines of a JSONL transcript covering its last records.
+    """Read a suffix window for small logs, or the indexed tail for large logs.
 
-    Equivalent to what ``for line in open(filepath)`` yields, restricted to a
-    suffix window large enough that the caller's ``deque(maxlen=tail_lines)``
-    sees the same records as a whole-file pass: the window extends backwards
-    from EOF until it holds tail_lines lines that pass the caller's own
-    filters (size cap + json.loads), or the file start is reached. A large
-    transcript then costs a small window read instead of reading and parsing
-    every byte. The window grows geometrically, so even a transcript whose
-    tail needs most of the file costs about one extra pass, not a rescan per
-    chunk.
-
-    Two equivalence details:
-
-    - Lines come from ``StringIO(text, newline=None)``, which iterates with
-      the same universal-newline semantics as text-mode file iteration, so
-      the caller's ``len(line)`` cap and ``json.loads`` see identical
-      strings.
-    - A window starting mid-file can cut inside a line (and inside a
-      multi-byte UTF-8 sequence, where ``errors="replace"`` would diverge
-      from a whole-file decode), so its first line is dropped and the window
-      must hold tail_lines valid records without it. At byte 0 the window is
-      the whole file and nothing is dropped.
+    Small-log windows retain universal-newline semantics and discard a leading
+    partial line. Indexed tails never grow a raw buffer to the source-file size.
     """
     _measure_facade = _compat.facade()
+    if _measure_facade.Path(filepath).stat().st_size > transcript_stream.LARGE_BYTES:
+        return transcript_stream.tail_lines(filepath, tail_lines)
     with open(filepath, "rb") as f:
         f.seek(0, _measure_facade.os.SEEK_END)
         pos = f.tell()
@@ -93,15 +76,7 @@ def _tool_call_target(name, inp):
 
 
 def _first_task_user_message(filepath):
-    """(text, source_id) of the FIRST real user task message, scanned from the
-    transcript head.
-
-    The tail window used for state extraction loses the objective on long
-    sessions, and the objective is definitionally the first user message — so
-    it gets its own bounded head pass (<=400 lines / <=8MB, early exit). The
-    caller redacts the returned text like every other ingested string.
-    Returns (None, None) when absent or unreadable. Never raises.
-    """
+    """Return the first user task and its source ID."""
     _measure_facade = _compat.facade()
     try:
         total = 0
@@ -116,7 +91,7 @@ def _first_task_user_message(filepath):
                     rec = _measure_facade.json.loads(line)
                 except _measure_facade.json.JSONDecodeError:
                     continue
-                if not isinstance(rec, dict) or rec.get("type") != "user":
+                if not isinstance(rec, dict) or rec.get("type") != "user" or rec.get("isSidechain"):
                     continue
                 text = _measure_facade._task_user_text(rec).strip()
                 if text:
@@ -179,11 +154,6 @@ def _extract_session_state(filepath, tail_lines=None):
     # Use deque to only keep the tail in memory (avoids loading entire file)
     records = _measure_facade.deque(maxlen=tail_lines)
     try:
-        if _measure_facade.os.stat(filepath).st_size > _measure_facade.codex_session.MAX_PARSE_FILE_BYTES:
-            return None
-    except OSError:
-        return None
-    try:
         for line in _measure_facade._iter_tail_lines(filepath, tail_lines):
             if len(line) > _measure_facade.codex_session.MAX_JSONL_LINE_CHARS:
                 continue
@@ -204,7 +174,7 @@ def _extract_session_state(filepath, tail_lines=None):
     file_count = 0
 
     for record in tail:
-        if not isinstance(record, dict):
+        if not isinstance(record, dict) or record.get("isSidechain"):
             continue
         rec_type = record.get("type")
 
@@ -339,16 +309,11 @@ def _extract_session_state(filepath, tail_lines=None):
                     error_context.append((recent_errors[-1][:200], assistant_text[:200].strip()))
                     recent_errors = []
 
-    # Objective head-scan: the FIRST user message, which the tail window can
-    # lose on long sessions. Redacted like every other ingested string.
     _obj_text, _obj_id = _measure_facade._first_task_user_message(filepath)
-    objective = None
-    if _obj_text:
-        objective = {
-            "text": _ingest_redact(_obj_text),
-            "source": {"kind": "user_message",
-                       "id": str(_obj_id) if _obj_id else None},
-        }
+    objective = {"text": _ingest_redact(_obj_text), "source": {"kind": "user_message", "id": _obj_id}} if _obj_text else None
+    _, direction, constraints = checkpoint_direction.scan(
+        filepath, _measure_facade._task_user_text, _ingest_redact,
+        _measure_facade.checkpoint_state, _measure_facade.codex_session.MAX_JSONL_LINE_CHARS)
 
     task_state = _measure_facade.checkpoint_state.build_task_state(
         user_texts=user_texts,
@@ -359,6 +324,9 @@ def _extract_session_state(filepath, tail_lines=None):
         changed_files=[(p, a) for p, a, _r in active_files if a == "modified"],
         objective=objective,
     )
+
+    task_state["current_direction"] = direction
+    task_state["user_constraints"] = constraints
 
     return {
         "active_files": active_files[-_measure_facade._CHECKPOINT_MAX_FILES:],
@@ -616,12 +584,14 @@ def _checkpoint_sections(state, quality_summary=None, archive_entries=None):
         ts_task = {}
     sections = []
 
-    # --- hard: the continuation-critical fields, always retained ---
+    direction = ts_task.get("current_direction") or []
+    if direction:
+        sections.append(_measure_facade._checkpoint_section(
+            "Current direction", ["## Current direction"] + ["- " + item["text"] for item in direction], "hard", None))
     obj = ts_task.get("objective") or {}
     if isinstance(obj, dict) and obj.get("text"):
         sections.append(_measure_facade._checkpoint_section(
-            "Objective", ["## Objective", str(obj["text"])], "hard",
-            _measure_facade.checkpoint_state.OBJECTIVE_MAX_CHARS + len("## Objective\n")))
+            "Session began", ["## Session began", "Session began with: " + str(obj["text"])[:200]], "optional", None, 999))
     constraints = ts_task.get("user_constraints") or []
     con_lines = ["## User Constraints"] + [
         f"- {c.get('text', '')}" for c in constraints
@@ -643,7 +613,7 @@ def _checkpoint_sections(state, quality_summary=None, archive_entries=None):
             "hard", 700))
 
     # --- keep: structured state, shrunk only under real pressure ---
-    if state["current_step"]["last_user"]:
+    if state["current_step"]["last_user"] and not direction:
         sections.append(_measure_facade._checkpoint_section(
             "Active Task",
             ["## Active Task", state["current_step"]["last_user"]],
@@ -797,7 +767,7 @@ def compact_capture(transcript_path=None, session_id=None, trigger=None, cwd=Non
     # stale. The offset suffix keeps it unambiguous; selection/age still use mtime.
     now = _measure_facade.datetime.now().astimezone()
     ts = now.strftime("%Y-%m-%dT%H:%M:%S%z")
-    ts_file = now.strftime("%Y%m%d-%H%M%S")
+    ts_file = now.strftime("%Y%m%d-%H%M%S") + "-u" + _measure_facade.os.urandom(8).hex()
 
     if _trusted_transcript is not None:
         filepath = _measure_facade.Path(_trusted_transcript)
@@ -846,8 +816,6 @@ def compact_capture(transcript_path=None, session_id=None, trigger=None, cwd=Non
             return None
         return str(checkpoint_path)
 
-    # Parse session state. The extractor redacts as it reads; a configured-but-
-    # broken custom pattern file makes it raise, and then nothing is written.
     try:
         from credential_patterns import RedactionConfigError as _ExtractCfgErr
     except Exception:
@@ -858,6 +826,12 @@ def compact_capture(transcript_path=None, session_id=None, trigger=None, cwd=Non
         return None
     if not state:
         return None
+    _sid = _measure_facade.sanitize_session_id(session_id or filepath.stem)
+    _cached = checkpoint_direction.previous_state(_measure_facade.CHECKPOINT_DIR, _sid)
+    _task = state.get("task_state") or {}
+    _task["user_constraints"] = checkpoint_direction.merge_constraints(_task.get("user_constraints"), _cached.get("user_constraints"))
+    if not _task.get("current_direction"):
+        _task["current_direction"] = _cached.get("current_direction") or []
 
     # Redact credentials from the whole checkpoint state (SEC-004). One
     # recursive pass over every string — including dict keys, tuples, and any
@@ -1005,12 +979,6 @@ def compact_capture(transcript_path=None, session_id=None, trigger=None, cwd=Non
         return None
 
     # JSON sidecar: structured companion for precise recovery. The MD is for
-    # Claude to read cold; the JSON lets Claude re-hydrate exact fields on
-    # demand. version 2 adds the versioned task_state (objective, constraints,
-    # requirements, verified facts vs assumptions, checks, dead ends, next
-    # action, done condition, archive pointers) — every field source-backed or
-    # explicitly listed in unknown_fields. All v1 keys are unchanged so older
-    # readers keep working.
     try:
         sidecar = {
             "version": 2,
@@ -1859,24 +1827,24 @@ def compact_restore(session_id=None, cwd=None, is_compact=None, new_session_only
         # CHECKPOINT_RELEVANCE_THRESHOLD. A home-dir / generic cwd yields no
         # opening context -> no score -> no pointer. The cross-session label,
         # the "NOT your own prior work" framing, the filename-format warning path,
-        # the 30-min age gate, and own-session exclusion are all preserved.
+        # the 24-hour age gate, and own-session exclusion are preserved.
         try:
             cur = _measure_facade.Path(cwd) if cwd else _measure_facade.Path.cwd()
         except Exception:
             cur = None
-        # Filter candidates once: own-session excluded, 30-min age gate applied.
+        # Filter candidates once: own-session excluded, 24-hour age gate applied.
         # The age gate and own-session exclusion are evaluated here (before
         # selection) so a stale or own-session checkpoint can never be the
         # relevance winner either.
         candidates = []
         for cp in checkpoints:
-            if sid_safe and sid_safe in cp["filename"]:
+            if sid_safe and sid_safe == _measure_facade._checkpoint_session(cp["filename"]):
                 continue
             try:
                 age_seconds = (_measure_facade.datetime.now() - cp["created"]).total_seconds()
             except Exception:
                 continue
-            if age_seconds > 1800:
+            if age_seconds > 86400:
                 continue
             candidates.append(cp)
         if not candidates:
@@ -1968,24 +1936,11 @@ def compact_restore(session_id=None, cwd=None, is_compact=None, new_session_only
         return
 
     if is_compact and sid_safe:
-        # Post-compaction: find best checkpoint for this session.
-        # Progressive checkpoints (captured at 50/65/80% fill) are preferred because
-        # they contain richer context than emergency checkpoints at ~98%.
-        # All checkpoint types use the retention-days window here: this path is
-        # both session-matched (sid_safe in filename) and post-compaction, so the
-        # most recent stop/end checkpoint from THIS session is the best continuity
-        # source after a compact regardless of wall-clock age. The old 5-min TTL
-        # gated out stop/end (the common triggers) and produced 0 restores.
-        # Selection is module-level (_order_checkpoints_for_restore) so the
-        # cold-resume-lean path shares the same "latest valid checkpoint"
-        # preference order.
+        # Exact-session restore can use an older save retained for an active session.
         now = _measure_facade.datetime.now()
-        retention_cutoff = now - _measure_facade.timedelta(days=_measure_facade._CHECKPOINT_RETENTION_DAYS)
         session_checkpoints = []
         for cp in checkpoints:
-            if sid_safe not in cp["filename"]:
-                continue
-            if cp["created"] < retention_cutoff:
+            if sid_safe != _measure_facade._checkpoint_session(cp["filename"]):
                 continue
             session_checkpoints.append(cp)
 
@@ -2012,21 +1967,10 @@ def compact_restore(session_id=None, cwd=None, is_compact=None, new_session_only
             merged = _measure_facade._merge_earlier_checkpoint_context(best_cp, ordered[1:4])
             _print_checkpoint_body(best_cp["path"], label, merged_body=merged)
             _print_intel_digest(sid_safe)
-            # Log the restore as an ESTIMATED credit: the working set the
-            # resumed session skips re-reading, floored at the legacy
-            # checkpoint-file-size estimate so we never regress. The re-read
-            # never happens, so nothing is metered -- _get_savings_summary
-            # files checkpoint_restore in the estimated tier.
+            # Only the estimated avoided working set is a credit. The injected
+            # checkpoint itself adds context and is never a savings floor.
             try:
-                cp_size = best_cp["path"].stat().st_size
-                # Calibrated floor (U-F: ~3.3 chars/tok), consistent with the TS
-                # ports and the rest of the estimator surface, not the legacy 4.0.
-                try:
-                    from token_estimate import estimate_tokens_from_bytes
-                    floor_tokens = estimate_tokens_from_bytes(cp_size)
-                except ImportError:
-                    floor_tokens = int(cp_size / _measure_facade.CHARS_PER_TOKEN)
-                est_tokens_recovered = _measure_facade._checkpoint_restore_recovery_tokens(sid_safe, floor_tokens)
+                est_tokens_recovered = _measure_facade._checkpoint_restore_recovery_tokens(sid_safe, 0)
                 if est_tokens_recovered > 0:
                     _measure_facade._log_savings_event("checkpoint_restore", est_tokens_recovered,
                                        session_id=sid_safe, detail=f"restored from {trigger_label}")
@@ -2034,12 +1978,7 @@ def compact_restore(session_id=None, cwd=None, is_compact=None, new_session_only
                 pass
             return
 
-        # No matching checkpoint found for this session. Never auto-restore a
-        # different session's body into post-compaction context; only surface a
-        # short pointer so the user can opt in if it is actually relevant.
-        latest = checkpoints[0]
-        if latest["created"] >= retention_cutoff:
-            print(f"[Token Optimizer] No matching checkpoint. Recent: {latest['path']}. Load if relevant.")
+        # No matching checkpoint: do not suggest a sibling during compaction.
         return
 
 
@@ -2880,7 +2819,7 @@ def _continuity_resume_block(text, checkpoints, sid_safe, cwd):
                 block = _measure_facade.build_lean_resume_context(cp_sid, prompt_text=text, cwd=cwd,
                                                   footer_mode=_named_footer)
                 if block:
-                    _measure_facade._log_resume_lean_savings(cp_sid, block)
+                    _measure_facade._log_resume_lean_savings(cp_sid, block, receiver_session_id=sid_safe)
                     return block
         # No checkpoint matches the named id. If the id was the WHOLE ask (no separate
         # resume verb) never substitute a different session -- return "". But when
@@ -2892,7 +2831,7 @@ def _continuity_resume_block(text, checkpoints, sid_safe, cwd):
 
     same_project = []
     for cp in checkpoints[:50]:
-        if sid_safe and sid_safe in cp.get("filename", ""):
+        if sid_safe and sid_safe == _measure_facade._checkpoint_session(cp.get("filename", "")):
             continue  # same-session recovery is SessionStart/compact's job
         sidecar = _measure_facade._read_checkpoint_sidecar(cp["path"])
         if not _measure_facade._checkpoint_in_project(sidecar, cwd):
@@ -2929,7 +2868,7 @@ def _continuity_resume_block(text, checkpoints, sid_safe, cwd):
     if block:
         # Count the cold-resume cost this lean reconstruction avoided (idempotent
         # per target session). Token-free; never blocks the injection.
-        _measure_facade._log_resume_lean_savings(sid, block)
+        _measure_facade._log_resume_lean_savings(sid, block, receiver_session_id=sid_safe)
     return block
 
 
@@ -3091,7 +3030,7 @@ def _continuity_prompt_hint(prompt_text=None, session_id=None, cwd=None, max_age
         # but among similar-relevance sessions the more active one wins.
         activity_weight = 1.0 + 0.5 * min(density, 20) / 20.0
         for checkpoint in _cps[:_per_session_scan]:
-            if sid_safe and sid_safe in checkpoint.get("filename", ""):
+            if sid_safe and sid_safe == _measure_facade._checkpoint_session(checkpoint.get("filename", "")):
                 continue
             score, sidecar = _measure_facade._checkpoint_topic_score(text, checkpoint, cwd=cwd)
             # Collect from the teaser floor (default 0.3); the full-block gate
@@ -3332,7 +3271,7 @@ def _best_checkpoint_for_session(session_id, within_retention=None):
     cutoff = _measure_facade.datetime.now() - _measure_facade.timedelta(days=_measure_facade._CHECKPOINT_RETENTION_DAYS)
     cands = []
     for cp in _measure_facade.list_checkpoints():
-        if sid_safe not in cp.get("filename", ""):
+        if sid_safe != _measure_facade._checkpoint_session(cp.get("filename", "")):
             continue
         if within_retention and cp["created"] < cutoff:
             continue
@@ -3757,7 +3696,7 @@ def _transcript_last_turn(sid_safe):
         return None
 
 
-def _log_resume_lean_savings(target_session_id, lean_block):
+def _log_resume_lean_savings(target_session_id, lean_block, receiver_session_id=None):
     """Credit the cold-resume cost avoided by reconstructing a session lean
     instead of `claude --resume`-ing it.
 
@@ -3812,9 +3751,20 @@ def _log_resume_lean_savings(target_session_id, lean_block):
         rates = tier_data["claude_models"].get(
             model_norm, tier_data["claude_models"].get("sonnet", {}))
         per_mtok = float(rates.get(rate_key) or rates.get("input", 3.0))
+        try:  # the session's exact model card, not its family card
+            conn = _measure_facade._open_trends_db_readonly(timeout=1.0)
+            try:
+                per_mtok = _measure_facade._counted_pricing_v5.resume_lean_log_rate(
+                    conn, sid_safe, model_norm, rate_key,
+                    lambda m: ((_measure_facade := _compat.facade()), _measure_facade._counted_exact_card(m, tier_data))[1]) or per_mtok
+            finally:
+                conn.close()
+        except Exception:
+            pass
         _measure_facade._log_savings_event("resume_lean", saved, session_id=sid_safe,
                            detail=f"lean resume vs --resume reload of last-turn context "
-                                  f"({basis}, ${per_mtok}/MTok)",
+                                  f"({basis}, ${per_mtok}/MTok)"
+                                  + (f" receiver={_measure_facade.sanitize_session_id(receiver_session_id)}" if receiver_session_id else ""),
                            model=model_norm, cost_per_mtok=per_mtok)
     except Exception:
         pass
@@ -4421,9 +4371,9 @@ def list_checkpoints(max_age_minutes=None):
 
             # Parse trigger type from filename suffix.
             trigger = "auto"
-            match = _measure_facade.re.search(r'-\d{8}-\d{6}-(.+)\.md$', safe_cp.name)
+            match = _measure_facade.re.search(r'-\d{8}-\d{6}-(?:u[0-9a-f]{16}(?:-(.+))?|(.+))\.md$', safe_cp.name)
             if match:
-                trigger = match.group(1)
+                trigger = match.group(1) or match.group(2) or "auto"
 
             checkpoints.append({
                 "path": safe_cp,
@@ -4452,9 +4402,8 @@ def _checkpoints_to_prune(checkpoints, now=None, days=None, total_max=None, per_
     - older than the retention window: removed;
     - per session: the newest `per_session`, plus the newest of each trigger
       (restore prefers earlier, richer saves over late stop saves), are kept;
-    - over the disk ceiling: extra saves go oldest first, then sessions' newest
-      saves oldest first, so a session's newest checkpoint is the last to go.
-    A session's newest checkpoint is removed only by age or the ceiling, never
+    - over the disk ceiling: extra saves go oldest first; newest saves survive.
+    A session's newest checkpoint is removed only by age, never
     by another session's activity. A file a writer has not seen yet is never in
     its list, so it cannot be removed by that writer.
     """
@@ -4489,8 +4438,6 @@ def _checkpoints_to_prune(checkpoints, now=None, days=None, total_max=None, per_
         drop_extra = extra[::-1][:over]
         prune.extend(drop_extra)
         over -= len(drop_extra)
-    if over > 0:
-        prune.extend(newest[::-1][:over])
     return prune
 
 
@@ -4509,12 +4456,11 @@ def _cleanup_checkpoints():
     if not checkpoints:
         return
 
-    for cp in _measure_facade._checkpoints_to_prune(checkpoints):
+    for cp in checkpoint_retention.exclude_latest(_measure_facade._checkpoints_to_prune(checkpoints), checkpoints, _measure_facade._checkpoint_session, _measure_facade._checkpoint_has_restorable_body):
         try:
             cp["path"].unlink()
         except OSError:
             continue
-        # Also delete the sibling JSON sidecar if present.
         try:
             cp["path"].with_suffix(".json").unlink()
         except OSError:
@@ -4587,7 +4533,7 @@ def _prune_trends_db():
             return
         cutoff_iso = (_measure_facade.datetime.now() - _measure_facade.timedelta(days=_measure_facade._TRENDS_RETENTION_DAYS)).isoformat()
         cutoff_date = cutoff_iso[:10]  # session_log.date is YYYY-MM-DD
-        conn = _measure_facade.sqlite3.connect(str(trends_path), timeout=5)
+        conn = _measure_facade.sqlite3.connect(str(trends_path), timeout=5, factory=upgrade_drain_control.SessionLogConnection)
         try:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA busy_timeout=5000")

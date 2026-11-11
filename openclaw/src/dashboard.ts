@@ -26,7 +26,7 @@ import { CoachData } from "./coach";
  * manifest is absent (skill-only install, test sandbox), falls back to the
  * compiled-in constant so the label is never blank.
  */
-const CORE_VERSION_FALLBACK = "5.13.69";
+const CORE_VERSION_FALLBACK = "5.13.70";
 
 /**
  * OpenClaw adapter version. Source of truth is `openclaw/package.json`; the
@@ -1362,7 +1362,7 @@ function renderSavings(data: DashboardData): string {
     return `<div class="view" id="view-savings">
       ${header}
       ${opportunityPanel}
-      ${pricingCoverage}
+      ${pricingCoverage}${data.savingsEvents.verbosityOutputEstimated?.events ? '<div class="daily-hint">Shorter replies and their re-reads: NOT MEASURED, no un-nudged control yet.</div>' : ''}
       ${measuredCard}
       ${progressCard || `<div class="card">
         <div class="empty-state">
@@ -1527,7 +1527,7 @@ function renderSavings(data: DashboardData): string {
     ${cumulative}
     ${levers}
     ${measuredFloor}
-    ${pricingCoverage}
+    ${pricingCoverage}${data.savingsEvents.verbosityOutputEstimated?.events ? '<div class="daily-hint">Shorter replies and their re-reads: NOT MEASURED, no un-nudged control yet.</div>' : ''}
   </div>`;
 }
 

@@ -9,6 +9,13 @@ import measure_split as split
 
 
 PASS1_PROVIDER_CEILING = 9000
+# Pure helper modules: imported by domain modules, never facade providers.
+HELPER_NAMES = ('dashboard_history', 'weekly_activity', 'headline', 'structural_ledger', 'structural_archives', 'structural_listing', 'structural_report', 'structural_seed', 'structural_value', 'counted_position', 'counted_pricing_v5', 'transcript_backfill', 'counted_subagents', 'lean_resume_threshold', 'output_reread', 'session_effect', 'rework_metrics', 'counted_orphans', 'counted_cap', 'archive_void_evidence', 'cost_per_message_trend', 'lean_resume_receivers', 'routing_period', 'fixture_context', 'session_best', 'savings_story', 'transcript_product', 'periphery_exposure', 'structure_funnel', 'setup_attachment_counter', 'first_read_outcomes', 'setup_budget_monitor', 'setup_connector_ledger', 'first_call_context', 'first_read_revive', 'mcp_archive_tripwire', 'compaction_survival', 'archive_void_codex', 'compression_fixture_void', 'feature_health', 'archive_health', 'coverage_report', 'file_refetch', 'holdout_report', 'structural_dedupe', 'setup_step')
+HELPER_NAMES += ('transcript_stream', 'quality_continuity', 'quality_checkpoint', 'codex_quality', 'checkpoint_direction', 'timestamp_cache', 'token_type_split', 'evidence_parallel', 'ttl_period', 'checkpoint_retention', 'lease_candidate_cleanup', 'session_store_spool', 'upgrade_drain_control', 'compression_scan_checkpoint')
+HELPER_NAMES += ('status_bar_lock', 'session_flush_lock', 'context_reset_marker', 'holdout_fallback', 'dashboard_heal_claim')
+HELPER_NAMES += ('keepwarm_safety', 'keepwarm_economics', 'keepwarm_linux', 'keepwarm_prefix', 'keepwarm_response_filter', 'keepwarm_guard', 'keepwarm_guard_server', 'keepwarm_fork', 'mod_action_booking', 'mod_compaction_booking', 'mod_fresh_booking')
+HELPER_NAMES += ('baseline_provenance', 'own_price_card')
+HELPERS = {name + '.py' for name in HELPER_NAMES}
 
 def check(root=split.REPO):
     root = Path(root)
@@ -18,7 +25,7 @@ def check(root=split.REPO):
     records = {row['name']: row for row in manifest['symbols']}
     if 'dispatch' in manifest:
         records['__main__'] = manifest['dispatch']
-    expected_files = {'__init__.py', '_compat.py', 'dashboard_history.py', 'weekly_activity.py'} | {name + '.py' for name in split.DOMAINS}
+    expected_files = {'__init__.py', '_compat.py', 'dashboard_history.py', 'weekly_activity.py', 'headline.py'} | HELPERS | {name + '.py' for name in split.DOMAINS}
     actual_files = {path.name for path in package.glob('*.py')}
     errors = []
     if actual_files != expected_files:
@@ -52,14 +59,14 @@ def check(root=split.REPO):
         limit = 200 if path.name == '_compat.py' else PASS1_PROVIDER_CEILING
         if len(text.splitlines()) > limit:
             errors.append(f'{path.name}: exceeds {limit} lines')
-        if path.name.startswith('_') or path.name in ('dashboard_history.py', 'weekly_activity.py'):
+        if path.name.startswith('_') or path.name in HELPERS:
             continue
         domain_tree = ast.parse(text)
         for node in ast.walk(domain_tree):
             if isinstance(node, ast.Import) and any(alias.name == 'measure' or alias.name.startswith('_measure.') for alias in node.names):
                 errors.append(f'{path.name}: direct domain/facade import at line {node.lineno}')
             if isinstance(node, ast.ImportFrom) and (node.module == 'measure' or node.module and node.module.startswith('_measure') or
-                    node.level and (node.module not in (None, '_compat') or any(alias.name not in ('_compat', 'dashboard_history', 'weekly_activity') for alias in node.names))):
+                    node.level and (node.module not in (None, '_compat') or any(alias.name not in ('_compat',) + HELPER_NAMES for alias in node.names))):
                 errors.append(f'{path.name}: direct domain/facade import at line {node.lineno}')
         for node in domain_tree.body:
             if isinstance(node, split.DEFINITION):
@@ -71,7 +78,7 @@ def check(root=split.REPO):
             elif isinstance(node, ast.ImportFrom):
                 allowed = (node.module == '__future__' or
                            node.level == 1 and node.module is None and
-                           all(a.name in ('_compat', 'dashboard_history', 'weekly_activity') for a in node.names))
+                           all(a.name in ('_compat',) + HELPER_NAMES for a in node.names))
                 if not allowed or any(a.name == '*' for a in node.names):
                     errors.append(f'{path.name}: direct domain/facade import')
             elif not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)):

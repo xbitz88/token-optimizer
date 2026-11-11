@@ -1,5 +1,6 @@
 """Runway saved tokens follow the same netting and ownership rules as the savings totals."""
 import importlib
+import json
 import sqlite3
 import sys
 import time
@@ -20,7 +21,12 @@ def m(monkeypatch, tmp_path):
     monkeypatch.syspath_prepend(str(SCRIPTS))
     sys.modules.pop("measure", None)
     mod = importlib.import_module("measure")
-    mod._init_trends_db().close()
+    conn = mod._init_trends_db()
+    day = datetime.now().date().isoformat()
+    conn.execute("INSERT INTO session_log(session_uuid,date,daily_usage_json) VALUES(?,?,?)",
+                 (SID, day, json.dumps({day: {"sonnet": {"cache_read": 1_000_000}}})))
+    conn.commit()
+    conn.close()
     monkeypatch.setattr(mod, "_keepwarm_read_meters", lambda now=None: {
         "available": True, "stale": False, "age_s": 60, "ts": time.time(),
         "five_hour_pct": 20.0, "seven_day_pct": 56.0,
@@ -62,9 +68,9 @@ def test_archive_reexpansion_is_netted_and_mirrors_count_once(m):
     assert saved == 70
 
 
-def test_reexpansion_never_drives_the_archive_credit_below_zero(m):
+def test_reexpansion_can_drive_archive_credit_below_zero(m):
     saved = _saved(m, savings=[("tool_archive", 100), ("tool_archive_reexpand", 300)])
-    assert saved == 0
+    assert saved == -200
 
 
 def test_compression_only_features_still_count(m):
@@ -77,3 +83,15 @@ def test_structure_map_mirror_counts_once(m):
     saved = _saved(m, savings=[("structure_map", 40)],
                    compression=[("structure_map", 90, 50, "measured")])
     assert saved == 40
+
+
+def test_reexpansion_can_exceed_archive_credit(m):
+    conn = m._init_trends_db()
+    conn.execute("INSERT INTO savings_events(timestamp,event_type,tokens_saved,session_id,session_uuid) VALUES(?,?,?,?,?)", (_ts(10), 'tool_archive', 100, SID, SID))
+    conn.execute("INSERT INTO savings_events(timestamp,event_type,tokens_saved,session_id,session_uuid) VALUES(?,?,?,?,?)", (_ts(9), 'tool_archive_reexpand', 300, SID, SID))
+    conn.commit()
+    assert m._runway_saved_tokens(conn, _ts(60)) == -200
+    net = m._net_realized_savings([('tool_archive', 1, 100, 1), ('tool_archive_reexpand', 1, 300, 3)], {})
+    assert net[1] == -200 and net[2] == -2
+    assert net[0]['tool_archive']['tokens_saved'] == -200
+    conn.close()

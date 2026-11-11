@@ -161,9 +161,9 @@ if __name__ in ("__main__",):
     from runtime_env import consume_runtime_flag as _consume_runtime_flag_early
     sys.argv[:] = _consume_runtime_flag_early(sys.argv, os.environ)
 
-from _measure import _compat as _measure_compat
+from _measure import _compat as _measure_compat, counted_pricing_v5 as _counted_pricing_v5, transcript_backfill as _transcript_backfill, counted_subagents as _counted_subagents, headline as _headline, structural_report as _structural_report
 _measure_providers = _measure_compat.prepare(sys.modules[__name__])
-
+from _measure import counted_cap as _counted_cap, output_reread as _output_reread, transcript_product as _transcript_product  # noqa: E402
 from hook_io import read_stdin_hook_input as _read_stdin_hook_input_shared
 from hook_runtime import (
     HookDeadline,
@@ -273,7 +273,7 @@ _CLAUDE_TARGET_CMDS = frozenset(
         "git-context", "dashboard-diagnose", "validate-impact",
         # Usage recommendations: the refresh replays Claude transcripts and
         # reads ~/.claude/settings.json; surfaces read its record file only.
-        "recommendations",
+        "recommendations", "coverage-replay", "file-refetch",
     }
 )
 # Back-compat alias (pre-Copilot name).
@@ -591,7 +591,7 @@ _FALLBACK_CLAUDE_MODELS = {
     "fable":  {"input": 10.0, "output": 50.0, "cache_read": 1.0,  "cache_write": 12.5,  "cache_write_1h": 20.0},
     "fable_5": {"input": 10.0, "output": 50.0, "cache_read": 1.0, "cache_write": 12.5, "cache_write_1h": 20.0},
     # Fable 5.1 / Mythos 5.1: cache reads are 0.025x input ($0.25), not 0.1x.
-    "fable_5_1": {"input": 10.0, "output": 50.0, "cache_read": 0.25, "cache_write": 12.5, "cache_write_1h": 20.0},
+    "fable_5_1": {"input": 10.0, "output": 50.0, "cache_read": 0.25, "cache_write": 12.5, "cache_write_1h": 20.0}, "fable_5_2": {"input": 8.0, "output": 40.0, "cache_read": 0.2, "cache_write": 10.0, "cache_write_1h": 16.0},
     "mythos_5": {"input": 10.0, "output": 50.0, "cache_read": 1.0, "cache_write": 12.5, "cache_write_1h": 20.0},
     "mythos_5_1": {"input": 10.0, "output": 50.0, "cache_read": 0.25, "cache_write": 12.5, "cache_write_1h": 20.0},
     # Opus 5.5 is $4/$20 with 0.05x cache reads; Opus 4.5+ is $5/$25; Opus <=4.1 is $15/$75.
@@ -2063,7 +2063,7 @@ _COUNTED_TWIN_WINDOW_SECONDS = 3.0
 # GLOB (case-sensitive, anchored). Real ids are UUIDs, short hex agent ids, or
 # harness ids such as Codex "rollout-<date>-<uuid>"; none of them match.
 _FIXTURE_SESSION_GLOBS = (
-    "test-session-*", "failwire-*", "unit-c-never*", "torture-*",
+    "test-session-*", "test-failbuild-*", "failwire-*", "unit-c-never*", "torture-*",
     "f3bench-sess*", "sess_test*",
 )
 # Tool names whose results carry images. Matched against the archive event's
@@ -2498,26 +2498,7 @@ classify_keepwarm_record = _measure_compat.bind(_measure_providers['cache_policy
 compact_keepwarm_sidecar = _measure_compat.bind(_measure_providers['cache_policy'].compact_keepwarm_sidecar, __name__, defaults=(None, None,))
 
 
-# ========== Keep-warm billing + consent gate (eligibility) ==========
-# THE pre-ping gate. The tick loop calls keepwarm_gate() before it touches any
-# armed record; it returns (allowed, reason) and nothing pings unless allowed is
-# True. Two independent conditions must both hold:
-#   * billing == 'api'  — keep-warm only recovers a *write premium*, which only
-#     API-key billing pays. On subscription auth a ping spends quota and saves
-#     nothing (never net-negative), so subscription is a HARD off and is
-#     never even asked for consent.
-#   * consent == 'enabled' — opt-in only (the default-on rule explicitly does NOT
-#     extend to token-spending features). Tri-state,
-#     sticky, stored via the same _write_config_flag/_config_lock surface as the
-#     rest of TO's config (0600 atomic write). States: unasked -> asked ->
-#     enabled|declined. enabled/declined are terminal unless an explicit CLI
-#     flip (keepwarm-enable / keepwarm-disable) moves them.
-# Detection is CONSERVATIVE by construction: anything we cannot positively
-# identify as API-key billing is treated as subscription (= off). Better to skip
-# a legitimate ping than to ever burn a subscription user's quota.
-# Every reader here is PURE + injectable (env dict + config paths) so the
-# tests can drive each ladder rung without touching the real machine.
-
+# Keep-warm pings fail closed until live-session refresh is proven safe.
 _KEEPWARM_CONSENT_KEY = "keepwarm_consent"
 # Valid sticky consent states. 'unasked' is the implicit default (no key yet).
 _KEEPWARM_CONSENT_STATES = ("unasked", "asked", "declined", "enabled")
@@ -2525,15 +2506,7 @@ _KEEPWARM_CONSENT_STATES = ("unasked", "asked", "declined", "enabled")
 # *inside* a ping resume can never recursively arm/ping again.
 _KEEPWARM_PING_ENV = "TOKEN_OPTIMIZER_KEEPWARM_PING"
 
-# ===== LLM-PING KILL: the ONLY token-spending step is off by default =====
-# Scope it tight: the WATCHER is awesome and stays ON -- the tick loop, meter
-# reading, resume/cache-drop classification, forecast, and quota model are all
-# code-only and spend ZERO tokens, so they keep watching "when the cash drops."
-# The ONE thing that spins up an LLM and costs tokens is the keep-warm ping
-# (`claude -p` in _keepwarm_fire_ping). THAT is gated off by default and never
-# ships hot. An operator can allow the LLM ping for internal dogfood ONLY by
-# explicitly setting the escape-hatch env var truthy; absent/false = ping OFF.
-# Everything else about keep-warm runs normally.
+# The legacy allow flag remains a supported explicit opt-out when set false.
 _KEEPWARM_ALLOW_LLM_PING_ENV = "TOKEN_OPTIMIZER_KEEPWARM_ALLOW_LLM_PING"
 
 
@@ -2617,11 +2590,8 @@ _KEEPWARM_SCHEDULER_LOG_NAME = "keepwarm-tick.log"
 # last_tick_ok/last_tick_age freshness signal independently of whether the log
 # carries a traceback (the log can be quiet-clean yet the scheduler dead).
 _KEEPWARM_TICK_STAMP_NAME = ".keepwarm-tick-stamp.json"
-# StartInterval: 5min (matches the "~5min" cadence). ThrottleInterval 60s so
-# launchd never hot-loops the tick if it exits fast. Log rotation guard truncates
-# the combined stdout/stderr log when it exceeds this size, on install and on the
-# tick's own check.
-_KEEPWARM_SCHEDULER_START_INTERVAL = 300
+# Check every minute and throttle launchd to prevent a hot loop.
+_KEEPWARM_SCHEDULER_START_INTERVAL = 60
 _KEEPWARM_SCHEDULER_THROTTLE = 60
 _KEEPWARM_SCHEDULER_LOG_MAX_BYTES = 1024 * 1024  # 1MB
 
@@ -2753,7 +2723,7 @@ _KEEPWARM_1H_CADENCE = _KEEPWARM_1H_WINDOW_SECONDS - _KEEPWARM_1H_SAFETY_MARGIN
 # 5m entries: the window is 300s; cadence (if viable at all) is window minus a
 # proportional margin. Viability is decided by the break-even formula, NOT this.
 _KEEPWARM_5M_WINDOW_SECONDS = 300
-_KEEPWARM_5M_SAFETY_MARGIN = 60
+_KEEPWARM_5M_SAFETY_MARGIN = 120
 _KEEPWARM_5M_CADENCE = _KEEPWARM_5M_WINDOW_SECONDS - _KEEPWARM_5M_SAFETY_MARGIN
 # Per-TTL write premium multiplier on the input rate, DERIVED from PRICING_TIERS
 # at module init (single source of truth -- no hand-copied numbers). The anthropic
@@ -3570,11 +3540,11 @@ _EVENT_RATE_CLASS = {"verbosity_steer_measured": "output", "verbosity_steer": "o
 # One statement per (source, has model_usage_json, has all_model_usage_json, by_day,
 # session-scoped). Grouping on column 1 is a no-op when it is the constant NULL.
 _REPRICE_SQL = _sql_variants(
-    "SELECT {day}, e.event_type, SUM(e.tokens_saved), SUM(e.cost_saved_usd), {mu}, {amu}, {mdl} "
+    "SELECT {day}, " + _counted_cap.reexpand_type("e") + ", SUM(e.tokens_saved), SUM(e.cost_saved_usd), {mu}, {amu}, {mdl} "
     "FROM {table} e "
     "LEFT JOIN session_log s ON e.session_uuid = s.session_uuid "
     "WHERE e.timestamp >= ? {scope}"
-    "GROUP BY 1, e.event_type, e.session_uuid, 7",
+    "GROUP BY 1, 2, e.session_uuid, 7",
     table={"counted_savings_events": "counted_savings_events", "savings_events": "savings_events"},
     mu={True: "s.model_usage_json", False: "NULL"},
     amu={True: "s.all_model_usage_json", False: "NULL"},
@@ -3611,10 +3581,10 @@ _session_model_reprice = _measure_compat.bind(_measure_providers['pricing']._ses
 #   * mcp_cap / hint_followed -- estimated-MAGNITUDE (fixed 5,000/event and
 #     conservative-guess sizes; _get_savings_summary relocates both to the
 #     estimated tier, so a counted annuity here would cross tiers);
-#   * verbosity_* -- output trims: generated once, never re-read.
+#   * verbosity_* -- output reductions are estimated, not counted removals.
 _COUNTED_SE_EVENT_TYPES = (
     "tool_archive", "tool_archive_reexpand", "tool_archive_refetch_block",
-    "structure_map", "delta_read",
+    "structure_map", "delta_read", "codemap_outline",
 )
 # compression_events features that are bookkeeping, not removals.
 _COUNTED_CE_EXCLUDED_FEATURES = (
@@ -3698,7 +3668,7 @@ _counted_session_path = _measure_compat.bind(_measure_providers['savings']._coun
 
 
 # Eligibility is per row. A global migration flag never certifies old prices.
-_COUNTED_PRICING_VERSION = "4"
+_COUNTED_PRICING_VERSION = "9"
 _COUNTED_META_PRICING = "counted_pricing_version"
 
 
@@ -3741,7 +3711,7 @@ _counted_backfill_all = _measure_compat.bind(_measure_providers['savings']._coun
 _counted_session_cache_mix = _measure_compat.bind(_measure_providers['savings']._counted_session_cache_mix, __name__, defaults=("cache_read",))
 
 
-_counted_rollup_rows = _measure_compat.bind(_measure_providers['savings']._counted_rollup_rows, __name__, defaults=(None,))
+_counted_rollup_rows = _measure_compat.bind(_measure_providers['savings']._counted_rollup_rows, __name__, defaults=(None, None))
 
 
 _counted_row_awaits_rescore = _measure_compat.bind(_measure_providers['savings']._counted_row_awaits_rescore, __name__)
@@ -4006,7 +3976,7 @@ _COLLECT_DRAIN_BUDGETS = {
            "counted_seconds": _COUNTED_PASS_DEADLINE_SECONDS},
     "inline": {"count_capped": False, "parse_seconds": 15.0, "commit_batch": 20,
                "daily_seconds": 15.0, "counted_sessions": 10**9, "counted_seconds": 30.0},
-    "full": {"count_capped": False, "parse_seconds": None, "commit_batch": 20,
+    "full": {"count_capped": False, "parse_seconds": None, "commit_batch": 1,
              "daily_seconds": 3600.0, "counted_sessions": 10**9, "counted_seconds": None},
 }
 _UPGRADE_DRAIN_META = "upgrade_drain_done"
@@ -5040,19 +5010,11 @@ _apply_daemon_restart_outcome = _measure_compat.bind(_measure_providers['daemon'
 CHECKPOINT_DIR = _STATE_BASE / "token-optimizer" / "checkpoints"
 CHECKPOINT_EVENT_LOG = _STATE_BASE / "token-optimizer" / "checkpoint-events.jsonl"
 
-# v6 dual-score architecture: ResourceHealth (monotonic warning) + SessionEfficiency (behavioral).
-# ResourceHealth can only worsen within a session (no rolling-window signals).
-# SessionEfficiency uses rolling windows and can rise or fall freely.
-# Score schema version. v2 (COMPACTION-QUALITY.md): compaction count carries
-# zero quality weight -- measured post-boundary recovery signals live in a
-# separate evidence panel instead of the count-only penalty. Consumers must
-# never compare or dampen a v1 score against a v2 score.
-_QUALITY_SCORE_VERSION = 2
+# ResourceHealth combines fill and waste with a bounded continuity prior.
+# SessionEfficiency remains a separate diagnostic; versions are not compared.
+_QUALITY_SCORE_VERSION = 3
 
 _RESOURCE_HEALTH_WEIGHTS = {
-    # Compaction count is descriptive metadata, not a quality signal: the
-    # count-only penalty is replaced by measured recovery evidence
-    # (recovery_status/recovery_evidence). Weights renormalized to 1.0.
     "context_fill_degradation": 5 / 7,
     "absolute_waste_tokens": 2 / 7,
 }
@@ -6630,7 +6592,7 @@ _write_config_flag = _measure_compat.bind(_measure_providers['lifecycle']._write
 # This lets power users override via env, but persistent state lives in config.json
 # so dashboard toggles work without touching shell profiles.
 
-V5_FEATURES = {
+V5_FEATURES = {**__import__('_measure.keepwarm_economics', fromlist=['feature_settings']).feature_settings(),
     "quality_nudges": {
         "env_var": "TOKEN_OPTIMIZER_QUALITY_NUDGES",
         "config_key": "v5_quality_nudges",
@@ -6813,8 +6775,8 @@ _LEGACY_SAVINGS_LABELS = {
     # the full transcript cold. Counterfactual trigger -> estimated tier
     # (popped from the measured total in _get_savings_summary).
     "resume_lean": "Lean resumes",
-    "tool_archive": "Tool replacements",
-    "structure_map": "Structure maps",
+    "tool_archive": "Tool replacements", "bash_archive_reexpand": "Bash output re-expanded",
+    "structure_map": "Structure maps", "codemap_outline": "Code map re-read outlines", "codemap_lookup": "Code map lookups [est]",
     # mcp_cap: ESTIMATED (not measured). Claude Code truncates MCP output
     # before PostToolUse fires, so the true pre-cap size is invisible to TO.
     # Logged by archive_result.py when an MCP result is at/near the configured
@@ -6835,7 +6797,7 @@ _LEGACY_SAVINGS_LABELS = {
     "verbosity_steer": "Verbosity steering [est]",
     # verbosity_steer_measured: the output reduction actually observed after a
     # conciseness nudge, compared with the session's own pre-nudge replies.
-    "verbosity_steer_measured": "Concise output (measured)",
+    "verbosity_steer_measured": "Concise output [est]",
     # tool_archive_refetch_block: a repeat call for an already-archived result
     # was answered from the archive instead of re-running the tool.
     "tool_archive_refetch_block": "Re-fetches answered from archive",
@@ -6891,7 +6853,7 @@ _V5_COMPRESSION_LABELS = {
     # errors and the summary line.
     "build_output_compress": "Build output compression",
     # Codex sessions: command output compressed by the Codex hook path.
-    "codex_command_compress": "Command output (Codex)",
+    "codex_command_compress": "Command output (Codex)", "mod_clean": "Clean-up from the Claude Code mod", "mod_clean_first": "Clean-up first from the Claude Code mod",
 }
 
 # compression_events features that are bookkeeping, shadow measurement, or a
@@ -6906,7 +6868,7 @@ _V5_COMPRESSION_LABELS = {
 _NON_SAVINGS_COMPRESSION_FEATURES = frozenset({
     "fresh_session_nudge", "cohort_demoted", "first_read_edit_followup",
     "cache_drop_warning", "agent_result_skeleton", "unknown", "loop_detection",
-    "context_advisory_shadow", "context_size_advisory",
+    "context_advisory_shadow", "context_size_advisory", "post_run_classify_shadow",
 })
 
 # Unified label dict used by the savings-report renderer. Legacy entries
@@ -6925,7 +6887,7 @@ _SAVINGS_CATEGORY_LABELS = {**_LEGACY_SAVINGS_LABELS, **_V5_COMPRESSION_LABELS, 
 # allowed to pull out of compression_events. Deriving this from the label
 # dict keeps the two in lockstep — add a key to _V5_COMPRESSION_LABELS and
 # it automatically shows up in the merged view.
-_V5_COMPRESSION_CATEGORIES = frozenset(_V5_COMPRESSION_LABELS.keys())
+_V5_COMPRESSION_CATEGORIES = frozenset(_V5_COMPRESSION_LABELS.keys()) - {"quality_nudge"}
 
 
 _estimate_compression_cost_per_mtok = _measure_compat.bind(_measure_providers['savings']._estimate_compression_cost_per_mtok, __name__, defaults=(None,))
@@ -6957,8 +6919,8 @@ _MIN_OVERAGE_USD_SHOWN = 10.0
 
 _RUNWAY_SAVED_SQL = _counted_sql(
     "savings_events",
-    "SELECT event_type, COALESCE(SUM(tokens_saved),0) FROM {table} "
-    "WHERE timestamp >= ? AND event_type != 'verbosity_steer' GROUP BY event_type")
+    "SELECT " + _counted_cap.reexpand_type() + ", COALESCE(SUM(tokens_saved),0) FROM {table} "
+    "WHERE timestamp >= ? AND event_type != 'verbosity_steer' GROUP BY 1")
 _RUNWAY_COMPRESSED_TOTAL_SQL = _counted_sql(
     "compression_events",
     "SELECT COALESCE(SUM(original_tokens-compressed_tokens),0) "
@@ -6975,13 +6937,13 @@ _RUNWAY_COMPRESSED_SQL = _counted_sql(
 # The runway figure is the measured floor, so it leaves them out too.
 _RUNWAY_ESTIMATED_EVENT_TYPES = frozenset(
     {"setup_optimization", "mcp_cap", "hint_followed", "resume_lean",
-     "checkpoint_restore"})
+     "checkpoint_restore", "codemap_lookup"})
 
 
 _runway_saved_tokens = _measure_compat.bind(_measure_providers['savings']._runway_saved_tokens, __name__, defaults=(False,))
 
 
-runway_snapshot = _measure_compat.bind(_measure_providers['savings'].runway_snapshot, __name__, defaults=(30, None,))
+runway_snapshot = _measure_compat.bind(_measure_providers['savings'].runway_snapshot, __name__, defaults=(30, None, None))
 
 
 _active_model_cache_rates = _measure_compat.bind(_measure_providers['savings']._active_model_cache_rates, __name__)
@@ -7189,10 +7151,6 @@ _sum_tool_calls = _measure_compat.bind(_measure_providers['savings']._sum_tool_c
 
 _estimate_output_waste = _measure_compat.bind(_measure_providers['savings']._estimate_output_waste, __name__, defaults=(30,))
 
-
-# A call gap beyond this many seconds likely dropped the prefix from cache,
-# forcing a full re-write on the next turn. Default 5m (the 5m cache TTL).
-_CACHE_DROP_GAP_SECONDS = _int_env("TOKEN_OPTIMIZER_CACHE_DROP_GAP_SECONDS", 300)
 
 
 _estimate_cache_drop_savings = _measure_compat.bind(_measure_providers['savings']._estimate_cache_drop_savings, __name__, defaults=(30,))
@@ -7497,7 +7455,7 @@ _allocate_cents = _measure_compat.bind(_measure_providers['savings']._allocate_c
 _format_cents = _measure_compat.bind(_measure_providers['savings']._format_cents, __name__)
 
 
-_action_savings_display = _measure_compat.bind(_measure_providers['savings']._action_savings_display, __name__, defaults=(False,))
+_action_savings_display = _measure_compat.bind(_measure_providers['savings']._action_savings_display, __name__, defaults=(False, 0.0))
 
 
 _action_savings_components = _measure_compat.bind(_measure_providers['savings']._action_savings_components, __name__, defaults=(None,))
@@ -7610,9 +7568,9 @@ _BUCKET_DAY_SQL = {True: "substr(timestamp, 1, 10)", False: "''"}
 _BUCKET_SESSION_SQL = {
     True: "AND (session_uuid = ? OR (session_uuid IS NULL AND session_id = ?)) ", False: ""}
 _BUCKET_SAVINGS_SQL = _sql_variants(
-    "SELECT {day}, event_type, COUNT(*), SUM(tokens_saved), "
+    "SELECT {day}, " + _counted_cap.reexpand_type() + ", COUNT(*), SUM(tokens_saved), "
     "SUM(cost_saved_usd) FROM {table} WHERE timestamp >= ? {scope}"
-    "GROUP BY 1, event_type ORDER BY 4 DESC",
+    "GROUP BY 1, 2 ORDER BY 4 DESC",
     table={"counted_savings_events": "counted_savings_events", "savings_events": "savings_events"},
     day=_BUCKET_DAY_SQL, scope=_BUCKET_SESSION_SQL)
 _BUCKET_COMPRESSION_SQL = _sql_variants(

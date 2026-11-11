@@ -9,7 +9,7 @@ import stat
 import sys
 
 PAYLOAD = ('devin_compress.py', 'devin_state.py', 'devin_doctor.py', 'devin_verify.py', 'devin_source.py',
-           'bash_compress.py', 'bash_search_results.py', 'bash_whitelist.py', 'credential_patterns.py',
+           'bash_compress.py', 'post_run_classify.py', 'preserved_reinject.py', 'bash_search_results.py', 'bash_whitelist.py', 'credential_patterns.py',
            'credential_url_patterns.py',
            'token_estimate.py', 'command_filters.py', 'runtime_env.py', 'py_trust.py', 'plugin_env.py', 'refetch_fingerprint.py',
            '_tomli.py', 'devin_hooks.py')
@@ -17,7 +17,7 @@ ALLOWED_MODULES = frozenset(Path(name).stem for name in PAYLOAD)
 
 # Repo names outside the installed closure must never fall back to sys.path.
 REPO_MODULES = frozenset((
-    '_measure', '_tomli',
+    '_measure', '_tomli', 'hook_skip_log', 'lean_resume_carry', 'structural',
     'activity_tracker', 'adapter_hook_command', 'antigravity_doctor', 'antigravity_hook_bridge', 'antigravity_install',
     'antigravity_proto', 'antigravity_session', 'antigravity_state', 'archive_result',
     'bash_compress', 'bash_search_results', 'bash_compress_hook', 'bash_hook', 'bash_whitelist', 'benchmark', 'cloud_kit',
@@ -29,7 +29,7 @@ REPO_MODULES = frozenset((
     'copilot_state', 'copilot_vscode', 'cowork_doctor', 'cowork_install',
     'credential_patterns', 'heal_report', 'hook_heal', 'hook_provenance', 'owned_hooks',
     'shipped_hook_templates', 'shipped_starter_hooks', 'cursor_doctor', 'cursor_hook_bridge', 'cursor_install',
-    'cursor_session', 'cursor_state', 'delta_diff', 'detectors', 'deterministic_candidates',
+    'cursor_session', 'cursor_state', 'dashboard_assets', 'delta_diff', 'detectors', 'deterministic_candidates',
     'devin_compress', 'devin_doctor', 'devin_hooks', 'devin_install', 'devin_source', 'devin_state',
     'devin_verify', 'grok_doctor', 'grok_hook_bridge', 'grok_install', 'grok_session',
     'grok_state', 'hermes_doctor', 'hermes_hook_bridge', 'hermes_install', 'hermes_session',
@@ -47,6 +47,11 @@ REPO_MODULES = frozenset((
     'cursor_statusline',
     'cursor_thrash',
     'cursor_transcript',
+    # Added by the 5.13.69 merges (pristine, codemap, quiet, coverage).
+    'archive_verify', 'codemap', 'codemap_hint', 'codemap_index', 'codemap_ledger', 'codemap_reread',
+    'coverage_funnel', 'hint_paths', 'holdout', 'post_run_classify', 'large_transcripts', 'preserved_reinject', 'session_store_guard',
+    # Added by 5.13.70 (settings self-heal keeps a secret-free backup).
+    'settings_backup',
 ))
 
 class SourceOnly(importlib.abc.MetaPathFinder, importlib.abc.Loader):

@@ -467,15 +467,15 @@ def test_racing_takeover_of_a_stale_lock_starts_one_child(sb, monkeypatch):
         st = real_stat(self, *a, **kw)
         if not raced["done"] and self == lock:
             raced["done"] = True
-            # Caller B runs to completion between A's staleness check and A's takeover.
-            assert sb._status_bar_start_refresh(SID_A) is True
+            # Caller B cannot enter while A holds the transition guard.
+            assert sb._status_bar_start_refresh(SID_A) is False
         return st
 
     monkeypatch.setattr(pathlib.Path, "stat", racing_stat)
-    assert sb._status_bar_start_refresh(SID_A) is False
+    assert sb._status_bar_start_refresh(SID_A) is True
     monkeypatch.setattr(pathlib.Path, "stat", real_stat)
     assert len(spawns) == 1
-    assert lock.read_text(encoding="ascii") == spawns[0]["env"][sb._STATUS_BAR_LOCK_TOKEN_ENV]
+    assert lock.read_text(encoding="ascii").split()[0] == spawns[0]["env"][sb._STATUS_BAR_LOCK_TOKEN_ENV]
     assert not list(lock.parent.glob(lock.name + ".*.stale"))
 
 
@@ -486,7 +486,7 @@ def test_child_gets_the_lock_token_in_its_environment(sb, monkeypatch):
     argv, kw = spawns[0]
     token = kw["env"]["TO_STATUS_BAR_LOCK_TOKEN"]
     assert len(token) == 32
-    assert sb._status_bar_lock_path(SID_A).read_text(encoding="ascii") == token
+    assert sb._status_bar_lock_path(SID_A).read_text(encoding="ascii").split()[0] == token
     assert not any("TOKEN" in a for a in argv), "the token travels by env, not the CLI"
 
 
@@ -529,25 +529,34 @@ def test_dashboard_saved_tokens_is_measured_plus_estimated(sb):
         "total_tokens": 1000,
         "mcp_cap_estimated": {"tokens_saved": 10},
         "hint_followed": {"tokens_saved": 20},
-        "verbosity_steer_estimated": {"tokens_saved": 30},  # fallback key, as the dashboard reads it
+        "verbosity_steer_estimated": {"tokens_saved": 30},  # diagnostic, never credited
         "resume_lean_estimated": {"tokens_saved": 40},
         "reread_avoided": {"reread_tokens": 999999},  # not in the headline
     }
-    assert sb._dashboard_saved_tokens(summary) == (1100, 1000)
+    assert sb._dashboard_saved_tokens(summary) == (1020, 1000)
     assert sb._dashboard_saved_tokens({}) == (0, 0)
 
 
-def test_dashboard_headline_formula_matches_the_dashboard_source():
-    # Drift guard: if the dashboard's Tokens Saved card changes its fields,
-    # _dashboard_saved_tokens must change with it.
+def test_dashboard_saved_tokens_matches_story_rows(sb):
+    summary = {
+        'total_tokens': 100,
+        'token_headline': {'context_removed_tokens': 100, 'output_not_generated_tokens': 10,
+                           'reread_tokens': 300, 'reload_avoided_tokens': 50},
+        'action_savings': {'logged_usd': 2, 'reread_usd': 1, 'reread_available': True,
+                           'estimated_usd': 1, 'estimates_usd': {'checkpoint_restore_estimated': 1}},
+        'structural_detail': {'method': 'trim_ledger', 'tokens_saved': 20, 'cost_saved_usd': 1,
+                              'estimated': {'tokens_saved': 40, 'cost_saved_usd': 1}},
+        'output_reread': {'tokens_saved': 60, 'cost_saved_usd': 1},
+    }
+    assert sb._dashboard_saved_tokens(summary) == (560, 100)
+
+
+def test_dashboard_headline_uses_savings_story_calculation():
+    # The status bar still reports once-removed tokens; the dashboard compounds them.
     html = (Path(__file__).resolve().parent.parent / "skills" / "token-optimizer" / "assets" / "dashboard.html").read_text(encoding="utf-8")
-    card = html[html.index("function tokensSavedCardHtml"):]
-    card = card[:card.index("var tsFullSaved")]
-    for field in ("s.mcp_cap_estimated", "s.hint_followed || s.hint_followed_estimated",
-                  "s.verbosity_steer || s.verbosity_steer_estimated", "s.resume_lean_estimated",
-                  "s.checkpoint_restore_estimated", "Number(s.total_tokens)"):
-        assert field in card, field
-    assert card.count("pushEst(obj, label)") == 5
+    card = html[html.index("function tokensSavedCardHtml"):html.index("function renderTrends()")]
+    assert "savingsStoryBands(data)" in card
+    assert "bands.totalTok" in card
 
 
 def test_compactions_counted_from_transcript(sb, tmp_path):
@@ -572,9 +581,9 @@ def test_post_compact_counts_a_compaction_the_transcript_does_not_show_yet(sb):
     assert sb._settled_compactions(0, {"compactions": 1, "_compact_bumped_at": 1000}, post_compact=True, now=1030) == 1
     # The next real compaction, later: counted again.
     assert sb._settled_compactions(1, {"compactions": 1, "_compact_bumped_at": 1000}, post_compact=True, now=5000) == 2
-    # Never lower than what was known; a parse that sees more wins.
-    assert sb._settled_compactions(0, {"compactions": 3}, post_compact=False) == 3
-    assert sb._settled_compactions(4, {"compactions": 3}, post_compact=True, now=9000) == 4
+    # V3 corrects an unconfirmed historical over-count after the pending window.
+    assert sb._settled_compactions(0, {"compactions": 3}, post_compact=False) == 0
+    assert sb._settled_compactions(4, {"compactions": 3}, post_compact=True, now=9000) == 5
 
 
 def test_recent_compact_boundary_reads_the_tail(sb, tmp_path):
@@ -621,10 +630,10 @@ def test_compactions_count_resumes_where_it_stopped_and_finds_split_markers(sb, 
 def test_dashboard_headline_shows_estimates_when_nothing_was_measured(sb):
     # Estimates still surface on their own: measured=0 no longer zeroes the card.
     assert sb._dashboard_saved_tokens({"total_tokens": 0, "hint_followed": {"tokens_saved": 500}}) == (500, 0)
-    assert sb._dashboard_saved_tokens({"total_tokens": 0, "checkpoint_restore_estimated": {"tokens_saved": 700}}) == (700, 0)
+    assert sb._dashboard_saved_tokens({"total_tokens": 0, "checkpoint_restore_estimated": {"tokens_saved": 700}}) == (0, 0)
     # Nothing measured AND nothing estimated -> the card stays hidden.
     assert sb._dashboard_saved_tokens({"total_tokens": 0}) == (0, 0)
-    assert sb._dashboard_saved_tokens({"total_tokens": "1e3", "mcp_cap_estimated": {"tokens_saved": "12.5"}}) == (1012, 1000)
+    assert sb._dashboard_saved_tokens({"total_tokens": "1e3", "mcp_cap_estimated": {"tokens_saved": "12.5"}}) == (1000, 1000)
 
 
 def test_post_compact_refresh_end_to_end_counts_once(sb, tmp_path):
@@ -737,7 +746,7 @@ def test_a_zero_headline_over_real_savings_is_reported_busy(sb, monkeypatch):
     assert sb._status_bar_savings_or_reason(SID_A) == (None, "savings database busy")
 
 
-def test_put_back_without_hard_links_never_replaces_a_newer_lock(sb, monkeypatch):
+def test_wrong_owner_release_does_not_move_existing_lock(sb, monkeypatch):
     sid = "aaaaaaaa-1111-2222-3333-666666666666"
     lock = sb._status_bar_lock_path(sid)
     lock.parent.mkdir(parents=True, exist_ok=True)
@@ -750,7 +759,7 @@ def test_put_back_without_hard_links_never_replaces_a_newer_lock(sb, monkeypatch
 
     monkeypatch.setattr(sb.os, "link", no_links)
     assert sb._status_bar_release_lock(sid, "my-token") is False
-    assert lock.read_text(encoding="ascii") == "newer-owner"
+    assert lock.read_text(encoding="ascii") == "old-owner"
     assert not list(lock.parent.glob(f"{lock.name}.*.release"))
 
 

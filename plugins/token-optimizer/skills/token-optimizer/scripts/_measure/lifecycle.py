@@ -1,6 +1,6 @@
 """Definition-only implementations; mutable state belongs to measure."""
 from __future__ import annotations
-from . import _compat, dashboard_history
+from . import _compat, dashboard_history, session_store_spool
 
 def _settings_lock(user_initiated=None):
     """Bounded portable lease for settings.json writes.
@@ -25,37 +25,12 @@ def _settings_lock(user_initiated=None):
         yield acquired
 
 def _acquire_session_end_flush_lock(max_age_seconds=None):
-    """Return a lock directory path, or None if another worker is active."""
-    _measure_facade = _compat.facade()
-    lock_dir = _measure_facade.SNAPSHOT_DIR / ".session-end-flush.lock"
-    try:
-        _measure_facade.SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
-        lock_dir.mkdir(mode=0o700)
-        return lock_dir
-    except FileExistsError:
-        try:
-            age = _measure_facade.time.time() - lock_dir.stat().st_mtime
-            if age > max_age_seconds:
-                lock_dir.rmdir()
-                try:
-                    lock_dir.mkdir(mode=0o700)
-                except FileExistsError:
-                    return None
-                return lock_dir
-        except OSError:
-            pass
-        return None
-    except OSError:
-        return None
+    from . import session_flush_lock
+    return session_flush_lock.acquire(_compat.facade(), max_age_seconds)
 
 def _release_session_end_flush_lock(lock_dir):
-    _measure_facade = _compat.facade()
-    if not lock_dir:
-        return
-    try:
-        lock_dir.rmdir()
-    except OSError:
-        pass
+    from . import session_flush_lock
+    session_flush_lock.release(lock_dir)
 
 
 def _session_refresh_due(min_interval_seconds=None):
@@ -607,21 +582,17 @@ def _dispatch_collect(args):
         _measure_facade._install_hook_budget(20) if (_measure_facade._running_under_hook() and not rebuild) else None
     )
     try:
-        _measure_facade.collect_sessions(days=days, quiet=quiet, rebuild=rebuild)
+        session_store_spool.drain_collect(_measure_facade.SNAPSHOT_DIR); _measure_facade.collect_sessions(days=days, quiet=quiet, rebuild=rebuild)
     except _measure_facade._HookTimeout:
         pass
+    except _measure_facade.sqlite3.OperationalError as exc:
+        if "locked" not in str(exc).lower() and "busy" not in str(exc).lower(): raise
+        try: _measure_facade._log_spawn_failure("collect deferred after SQLite contention")
+        except Exception: pass
     finally:
         _measure_facade._clear_hook_budget(deadline)
 
-    # Existing-script-install self-heal. An old script
-    # install has the collect&&dashboard fossil in settings.json and NO
-    # ensure-health SessionStart hook, so run_ensure_health never reaches it.
-    # The fossil's OWN hook-path run reconciles settings.json here, removing
-    # the fossil going forward. Runs AFTER the flush and its 20s budget are
-    # cleared, so it never delays the flush itself; the self-heal carries its
-    # OWN short deadline (see the helper) so a stalled settings write can't
-    # hold the hook pipe open. Throttled to 24h, fail-open. Gated on the hook
-    # path so an interactive terminal `collect` never triggers it.
+    # Repair legacy hook installs after the bounded collect finishes.
     if _measure_facade._running_under_hook():
         try:
             _measure_facade._maybe_self_heal_sessionend_fossils_on_hook()
@@ -818,71 +789,8 @@ def _dashboard_selfheal_build_lock():
 
 
 def _dashboard_heal_spawn_due():
-    """Return True iff THIS caller should spawn a dashboard heal.
-
-    Bug (thundering herd): on a version bump every concurrent
-    SessionStart's ensure-health tick sees the stale sidecar and each spawns a
-    DETACHED, unbounded, FORCED ~9s rebuild -- N sessions => N simultaneous
-    builds all racing os.replace on the same dashboard.html (the very lock
-    contention the api/regenerate retry was calibrated around). This collapses
-    that to ONE: the first caller atomically claims ``dashboard.heal.lock``
-    (O_CREAT|O_EXCL, the same pidfile shape as ``_keepwarm_tick_singleton`` and
-    ``_daemon_install_lock``) and spawns; concurrent callers within the staleness
-    window see the fresh marker and skip. The marker is deliberately NOT unlinked
-    on the happy path -- it must OUTLIVE this call to suppress the herd, and it is
-    reclaimed by the next caller once it ages past the window.
-
-    The child holds a separate OS lock for the full rebuild. Check it here so
-    even an expired marker cannot launch another child while one is working.
-    Fail-OPEN on filesystem errors; the child lock still prevents duplicate work.
-    """
-    _measure_facade = _compat.facade()
-    if _measure_facade._dashboard_selfheal_inflight():
-        return False
-    marker = _measure_facade.SNAPSHOT_DIR / _measure_facade._DASHBOARD_HEAL_LOCK_NAME
-    try:
-        _measure_facade.SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        return True
-    fd = None
-    try:
-        fd = _measure_facade.os.open(str(marker), _measure_facade.os.O_CREAT | _measure_facade.os.O_EXCL | _measure_facade.os.O_WRONLY, 0o600)
-    except FileExistsError:
-        # A recent spawn already claimed the marker. Reclaim ONLY if it is stale;
-        # a fresh marker means a heal is already in flight, so no-op.
-        try:
-            age = _measure_facade.time.time() - marker.stat().st_mtime
-        except OSError:
-            return True  # unreadable mtime: don't suppress the heal
-        if age <= _measure_facade._DASHBOARD_HEAL_LOCK_STALE_SECONDS:
-            return False
-        # Known bounded residual (same unlink+O_EXCL shape as
-        # _keepwarm_tick_singleton): the fresh-claim path above is race-free, but
-        # if TWO ticks both observe the SAME stale marker and both pass the age
-        # check before either unlinks, both can reclaim and spawn -- at most 2
-        # rebuilds, only at the 60s staleness edge with concurrent sessions. That
-        # is consistent with the fail-open contract (an extra rebuild is harmless;
-        # the detached child is itself idempotent via os.replace + the version
-        # guard), so it is accepted rather than serialised with a heavier lock.
-        try:
-            _measure_facade.os.unlink(str(marker))
-            fd = _measure_facade.os.open(str(marker), _measure_facade.os.O_CREAT | _measure_facade.os.O_EXCL | _measure_facade.os.O_WRONLY, 0o600)
-        except FileExistsError:
-            return False  # lost the reclaim race to another session -- it heals
-        except OSError:
-            return True
-    except OSError:
-        return True
-    try:
-        _measure_facade.os.write(fd, str(_measure_facade.os.getpid()).encode("ascii"))
-    except OSError:
-        pass
-    finally:
-        try:
-            _measure_facade.os.close(fd)
-        except OSError:
-            pass
-    return True
+    from . import dashboard_heal_claim
+    return dashboard_heal_claim.claim(_compat.facade())
 
 
 def _is_plugin_installed():
@@ -3791,8 +3699,8 @@ def _is_v5_feature_enabled(feature_name):
         if r is not None:
             return r
 
-    # Config.json (user, then plugin-data, via _read_config_flag).
     config_val = _measure_facade._read_config_flag(feat["config_key"], None)
+    if feature_name == "keepwarm" and config_val is None and _measure_facade._read_config_flag("keepwarm_consent", "unasked") == "declined": return False
     if config_val is not None:
         r = _measure_facade.interpret_flag_value(config_val, env_truthy_value=tv)
         if r is not None:
@@ -3805,8 +3713,8 @@ def _set_v5_feature(feature_name, enabled):
     """Enable or disable a v5 feature via config.json (persistent, dashboard-friendly)."""
     _measure_facade = _compat.facade()
     feat = _measure_facade.V5_FEATURES.get(feature_name)
-    if not feat:
-        return False
+    if not feat: return False
+    if feature_name == "keepwarm": return False
     _measure_facade._write_config_flag(feat["config_key"], bool(enabled))
     return True
 
@@ -3879,9 +3787,7 @@ def _get_v5_feature_status():
         except OSError:
             codex_hooks_text = ""
     for name, feat in _measure_facade.V5_FEATURES.items():
-        # Resolve env from the process AND settings.json so the dashboard sees
-        # flags a user "marked" even when this process (e.g. the daemon) did not
-        # inherit Claude Code's env injection.
+        if name == "keepwarm" and (_measure_facade.detect_runtime() != "claude" or _measure_facade._normalized_platform() == "Windows"): continue
         env_val = _measure_facade._resolve_feature_env(feat["env_var"])
         config_val = _measure_facade._read_config_flag(feat["config_key"], None)
         enabled = _measure_facade._is_v5_feature_enabled(name)
@@ -3903,9 +3809,9 @@ def _get_v5_feature_status():
             "how": feat["how"],
             "risk": feat["risk"],
             "risk_level": feat.get("risk_level", "none"),
-            "recommended": recommended,
-            "enabled": enabled,
-            "source": source,
+            "recommended": recommended if name != "keepwarm" else False,
+            "enabled": enabled if name != "keepwarm" else False,
+            "source": source if name != "keepwarm" else "paused",
             "env_var": feat["env_var"],
             "config_key": feat["config_key"],
         }
@@ -4375,43 +4281,18 @@ def _settings_read_highwater() -> dict | None:
 
 
 def _settings_update_highwater(data: dict) -> bool:
-    """Update the high-water mark if this sighting has MORE top-level keys
-    AND has at least one user-authored key. A file with only machine-written
-    keys is never a valid high-water candidate (it could be wipe residue
-    with more keys than the real highwater). Returns True if updated."""
+    """Snapshot settings.json WITHOUT secrets (settings_backup.scrub) when the
+    file has at least one user-authored key. env, API-key helpers, MCP env and
+    headers and any credential-looking value never reach the snapshot. True if
+    updated."""
     _measure_facade = _compat.facade()
-    if not isinstance(data, dict) or not data:
-        return False
-    # Poisoning guard: only snapshot files that have user-authored keys.
-    # A file with only machine-written keys is wipe residue, not a valid
-    # high-water candidate.
-    if not _measure_facade._settings_has_user_keys(data):
-        return False
+    if not isinstance(data, dict) or not _measure_facade._settings_has_user_keys(data):
+        return False  # poisoning guard: a machine-only file is wipe residue
     try:
-        d = _measure_facade._settings_heal_ensure_dir()
-        if d is None:
-            return False
-        existing = _measure_facade._settings_read_highwater()
-        if existing is None or len(data) > len(existing):
-            if not _measure_facade._settings_write_file_secure(
-                d / "highwater.json",
-                _measure_facade.json.dumps(data, indent=2, ensure_ascii=False) + "\n",
-            ):
-                return False
-            # Record metadata.
-            meta = {
-                "key_count": len(data),
-                "key_set": sorted(data.keys()),
-                "timestamp": _measure_facade.datetime.now().isoformat(),
-            }
-            _measure_facade._settings_write_file_secure(
-                d / "highwater.meta.json",
-                _measure_facade.json.dumps(meta, indent=2) + "\n",
-            )
-            return True
+        import settings_backup
+        return settings_backup.update_highwater(_measure_facade, data) is not None
     except (OSError, TypeError):
-        pass
-    return False
+        return False
 
 
 def _settings_read_tombstones() -> set:
@@ -4787,25 +4668,34 @@ def _maybe_self_heal_settings() -> None:
          a. Read the high-water mark. If none, fail open (nothing to restore).
          b. Compute absent keys = high-water keys - live keys - tombstoned.
          c. If no absent keys, fail open.
-         d. Backup the live file via _backup_settings_file. If backup fails,
+         d. Back up the live file minus secrets (settings_backup). If it fails,
             ABORT (no restore without a backup).
          e. Re-read settings.json under the settings lock to avoid value race.
          f. Additive merge: add only absent keys from the high-water mark.
          g. Write via _settings_write_atomic_silent (suppresses guard stderr).
          h. Log the restoration.
 
-    SILENT: no stdout, no stderr to the user. All diagnostics go to the heal
-    log. FAIL OPEN: any error returns without touching the file.
+    The snapshot and the pre-restore backup never hold secrets
+    (settings_backup.scrub); a scrubbed value stays absent on restore. stdout
+    stays silent; a restore prints one stderr line, names the keys it could not
+    restore, and is recorded in the heal log. TOKEN_OPTIMIZER_SETTINGS_HEAL=0
+    skips snapshot and restore. FAIL OPEN: any error returns without touching
+    the file.
     """
     _measure_facade = _compat.facade()
     try:
-        data, _path, ok = _measure_facade._read_settings_json_checked()
-        if not ok or not isinstance(data, dict):
-            return  # unreadable or malformed: fail open
-
+        import settings_backup
         heal_dir = _measure_facade._settings_heal_ensure_dir()
         if heal_dir is None:
             return  # can't create heal dir: fail open
+        # Shrink older full copies to owned keys even when the heal is off:
+        # it only removes data. TOKEN_OPTIMIZER_SETTINGS_HEAL=0 skips the rest.
+        settings_backup.migrate_to_secret_free(_measure_facade)
+        if settings_backup.heal_disabled():
+            return
+        data, _path, ok = _measure_facade._read_settings_json_checked()
+        if not ok or not isinstance(data, dict):
+            return  # unreadable or malformed: fail open
 
         # --- Healthy sighting: check tombstones + snapshot ---
         if _measure_facade._settings_has_user_keys(data):
@@ -4814,11 +4704,10 @@ def _maybe_self_heal_settings() -> None:
             _measure_facade._settings_check_tombstones(data, previously_restored)
             # Snapshot: update high-water mark if richer.
             if _measure_facade._settings_update_highwater(data):
+                _kept = settings_backup.read_meta(_measure_facade)
                 _measure_facade._settings_heal_log(
-                    "snapshot",
-                    key_count=len(data),
-                    key_set=sorted(data.keys()),
-                )
+                    "snapshot", key_count=_kept.get("key_count"), key_set=_kept.get("key_set"),
+                    withheld_keys=_kept.get("withheld_keys"))
             # Time-proximity signal: record last healthy sighting timestamp.
             _measure_facade._settings_write_file_secure(
                 heal_dir / "last_healthy.json",
@@ -4831,7 +4720,7 @@ def _maybe_self_heal_settings() -> None:
         if not _measure_facade._settings_is_wipe_residue(data):
             return  # has unknown keys that aren't machine-written: fail open
 
-        highwater = _measure_facade._settings_read_highwater()
+        highwater = settings_backup.read_highwater(_measure_facade)
         if not highwater:
             return  # no high-water mark: nothing to restore from
 
@@ -4843,10 +4732,10 @@ def _maybe_self_heal_settings() -> None:
         if not absent_keys:
             return  # nothing to restore (all missing keys are tombstoned)
 
-        # Pre-restore backup (reuses the existing _backup_settings_file helper).
+        # Pre-restore backup of the live file, secret-free (settings_backup.backup_scrubbed).
         # If the backup fails, ABORT: no restore without a reversible backup.
         backup_dir = heal_dir / "backups"
-        backup_path = _measure_facade._backup_settings_file(backup_dir)
+        backup_path = settings_backup.backup_scrubbed(_measure_facade, backup_dir)
         if backup_path is None:
             _measure_facade._settings_heal_log(
                 "restore_aborted",
@@ -4900,6 +4789,7 @@ def _maybe_self_heal_settings() -> None:
         # Write via the silent atomic writer (suppresses guard stderr).
         # The guard will verify we're not dropping any keys.
         if _measure_facade._settings_write_atomic_silent(merged):
+            _notice = settings_backup.restore_notice(restored, settings_backup.read_meta(_measure_facade))
             _measure_facade._settings_heal_log(
                 "restore",
                 restored_keys=restored,
@@ -4908,7 +4798,9 @@ def _maybe_self_heal_settings() -> None:
                 backup_path=str(backup_path),
                 live_key_count=len(data),
                 healed_key_count=len(merged),
+                notice=_notice,
             )
+            settings_backup.announce_restore(_notice)
     except Exception:
         # Fail open, always. A heal that breaks a session is a worse bug
         # than the one it heals.

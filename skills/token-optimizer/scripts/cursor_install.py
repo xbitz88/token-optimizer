@@ -54,6 +54,8 @@ _PAYLOAD_MODULES = (
     "cursor_quality.py",
     "bash_hook.py",
     "bash_compress.py",
+    "post_run_classify.py",
+    "preserved_reinject.py",
     "bash_search_results.py",
     # Dependency-free whitelist gate shared by bash_hook + bash_compress.
     "bash_whitelist.py",
@@ -102,12 +104,22 @@ _PAYLOAD_MODULES = (
     "cursor_thrash.py",
     "thrash_guard.py",
     "session_store.py",
+    "session_store_guard.py",
+    "hint_paths.py",  # session_store imports it at module load
     "delta_diff.py",
     "archive_result.py",
     "recovery_output.py",
     "refetch_fingerprint.py",
     "reset_epoch.py",
     "token_estimate.py",
+    # session_store queues contended writes through the spool and publishes
+    # reset markers; both live in the _measure package.
+    "_measure/__init__.py",
+    "_measure/session_store_spool.py",
+    "_measure/lease_candidate_cleanup.py",
+    "_measure/context_reset_marker.py",
+    "hook_provenance.py",
+    "shipped_hook_templates.py",  # hook_provenance imports it at module load
     "cursor_transcript.py",
 )
 

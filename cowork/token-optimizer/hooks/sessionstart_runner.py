@@ -368,6 +368,12 @@ def _emit_session_start_stdout(parts, hook_input: dict) -> None:
 # --------------------------------------------------------------------------- #
 
 
+def _observe_setup_budget(hook_input: dict) -> None:
+    if measure.detect_runtime() == "claude":
+        from _measure.setup_budget_monitor import observe_hook
+        observe_hook(hook_input, measure.TRENDS_DB)
+
+
 def _sub_ensure_health(hook_input: dict) -> None:
     """``measure.py ensure-health --once-mark`` (hooks.json entry 1).
 
@@ -485,14 +491,13 @@ def _sub_clear_compacted(hook_input: dict) -> None:
 def _sub_compact_restore_new_session(hook_input: dict, sink: list) -> None:
     """``measure.py compact-restore --new-session-only --once-mark`` (entry 5).
 
-    Mirrors the ``compact-restore`` dispatch (measure.py ~L42582) with
-    ``--new-session-only --once-mark``: _mark_ran_this_session (WRITE, never
-    check -- a resume/compact SessionStart is NOT latched out), then
-    compact_restore(new_session_only=True), with the same Codex/Cowork wrap
-    routed into the shared ``sink``.
+    Mark every start so the first-prompt fallback stays quiet; offer a
+    cross-session pointer only on a fresh startup, never resume or compact.
     """
     sid = hook_input.get("session_id")
     measure._mark_ran_this_session("compact-restore-new-session", sid)
+    if hook_input.get("source", "startup") != "startup" or _is_compact_start(hook_input):
+        return
     budget = _runner_budget(measure._int_env("TOKEN_OPTIMIZER_COMPACT_RESTORE_BUDGET", 8))
     if budget < 0.1:
         return
@@ -500,6 +505,18 @@ def _sub_compact_restore_new_session(hook_input: dict, sink: list) -> None:
     with redirect_stdout(buf):
         measure.compact_restore(session_id=sid, new_session_only=True)
     sink.append(buf.getvalue())
+
+
+def _sub_codemap_hint(hook_input: dict) -> None:
+    """Code map discovery hint (codemap_hint.py): plain text, so it lands in
+    additionalContext via the envelope. Silent when the feature is off
+    (TOKEN_OPTIMIZER_CODEMAP=0) or the cwd has no Python/JS/TS code. Takes no
+    runner budget share: a bounded directory probe plus a detached index warm."""
+    import codemap_hint  # noqa: PLC0415
+
+    text = codemap_hint.session_text(hook_input)
+    if text:
+        print(text)
 
 
 def _quality_cache_self_heal() -> None:
@@ -624,6 +641,7 @@ def main() -> int:
     _runner_budget(8, subcommand_count_hint=pending)
 
     _capture("ensure-health", _sub_ensure_health, hook_input)
+    _capture("setup-budget-observation", _observe_setup_budget, hook_input)
     _capture("quality-cache --force", _sub_quality_cache_force, hook_input)
     if is_compact:
         _capture("compact-restore --compact", _sub_compact_restore_compact,
@@ -632,6 +650,7 @@ def main() -> int:
         _capture("read_cache --clear-compacted", _sub_clear_compacted, hook_input)
     _capture("compact-restore --new-session-only", _sub_compact_restore_new_session,
              hook_input, _wrapped)
+    _capture("codemap hint", _sub_codemap_hint, hook_input)
 
     # Emit the compact-restore payloads and ensure-health/quality-cache
     # systemMessage lines as ONE host-valid JSON object. systemMessage values

@@ -28,6 +28,7 @@ import importlib
 import json
 import sqlite3
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -120,6 +121,22 @@ def _rows(dbp):
             "FROM savings_events").fetchall()
     finally:
         conn.close()
+
+
+def test_duplicate_resume_ledger_writes_are_idempotent(m, tmp_path, monkeypatch):
+    dbp = _db(m, tmp_path, monkeypatch)
+    for _ in range(2):
+        m._log_savings_event("resume_lean", 100, session_id=SID, model="sonnet", cost_per_mtok=1.0)
+    assert len(_rows(dbp)) == 1
+
+
+def test_concurrent_resume_ledger_writes_are_idempotent(m, tmp_path, monkeypatch):
+    dbp = _db(m, tmp_path, monkeypatch)
+    def write(_):
+        m._log_savings_event("resume_lean", 100, session_id=SID, model="sonnet", cost_per_mtok=1.0)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(write, range(8)))
+    assert len(_rows(dbp)) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -306,3 +323,12 @@ def test_advisor_resume_credit_uses_executor_context_not_billed_sum(m, tmp_path,
     rate = "cache_read" if age_minutes < 60 else "cache_write_1h"
     assert cost == pytest.approx(expected * float(_rates(m, "opus")[rate]) / 1e6)
     assert model == "opus"
+
+
+def test_resume_event_records_receiving_session(m, tmp_path, monkeypatch):
+    dbp = _db(m, tmp_path, monkeypatch)
+    _transcript(m, tmp_path, monkeypatch, ctx=500_000, age_minutes=20)
+    receiver = '12345678-1111-2222-3333-123456789abc'
+    m._log_resume_lean_savings(SID, 'context', receiver_session_id=receiver)
+    row, = _rows(dbp)
+    assert 'receiver=' + receiver in row[4]

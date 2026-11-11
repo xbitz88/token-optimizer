@@ -1,6 +1,6 @@
 """Definition-only implementations; mutable state belongs to measure."""
 from __future__ import annotations
-from . import _compat
+from . import _compat, fixture_context, counted_cap, archive_void_evidence, compression_fixture_void, upgrade_drain_control
 
 
 def _classify_jsonl_is_sidechain(filepath, max_lines=None):
@@ -556,13 +556,13 @@ def _counted_view_statements():
     return (
         "CREATE TEMP VIEW IF NOT EXISTS counted_savings_events AS "
         "SELECT e.* FROM main.savings_events e "
-        f"WHERE NOT {_measure_facade._fixture_session_sql('e.session_id')}"
-        f" AND NOT (e.event_type IN ({media_types}) AND e.detail IS NOT NULL AND ({media}))"
+        f"WHERE NOT {_measure_facade._fixture_session_sql('e.session_id')} AND NOT {_measure_facade._fixture_session_sql('e.session_uuid')} AND {fixture_context.excluded_session_sql('e')}"
+        f" AND NOT COALESCE({counted_cap.contradicted('e')}, 0) AND NOT (e.event_type IN ({media_types}) AND e.detail IS NOT NULL AND ({media}))"
         f" AND NOT (e.event_type = 'tool_archive_reexpand' AND COALESCE(e.session_id, '') != '' AND {media_pair})"
         f" AND NOT (e.tokens_saved > 0 AND COALESCE(e.session_id, '') != '' AND {se_twin})",
         "CREATE TEMP VIEW IF NOT EXISTS counted_compression_events AS "
         "SELECT c.* FROM main.compression_events c "
-        f"WHERE NOT {_measure_facade._fixture_session_sql('c.session_id')}"
+        f"WHERE NOT {_measure_facade._fixture_session_sql('c.session_id')} AND NOT {_measure_facade._fixture_session_sql('c.session_uuid')} AND {fixture_context.excluded_session_sql('c')}"
         f" AND NOT (c.original_tokens > c.compressed_tokens AND COALESCE(c.session_id, '') != '' AND {ce_twin})",
     )
 
@@ -578,7 +578,7 @@ def _counted_media_candidate_statement():
         "SELECT 'md:'||e.id, e.session_uuid, e.timestamp, 0, NULL, e.model "
         "FROM main.savings_events e WHERE e.event_type = 'tool_archive' AND e.timestamp >= ? "
         f"AND e.detail IS NOT NULL AND ({media}) "
-        f"AND NOT {_measure_facade._fixture_session_sql('e.session_id')} "
+        f"AND NOT {_measure_facade._fixture_session_sql('e.session_id')} AND NOT {_measure_facade._fixture_session_sql('e.session_uuid')} AND {fixture_context.excluded_session_sql('e')} "
         f"AND NOT (e.tokens_saved > 0 AND COALESCE(e.session_id, '') != '' AND {se_twin})"
     )
 
@@ -592,15 +592,26 @@ def _ensure_counted_views(conn):
     are missing or the SQLite build lacks window functions."""
     _measure_facade = _compat.facade()
     try:
+        conn.create_function('to_transcript_has_usage', 1, fixture_context.has_usage)
         have = {r[0] for r in conn.execute(
             "SELECT name FROM sqlite_temp_master WHERE type='view'").fetchall()}
         if {"counted_savings_events", "counted_compression_events"} <= have:
             return True
-        for statement in _measure_facade._COUNTED_VIEW_SQL:
+        statements = list(_measure_facade._COUNTED_VIEW_SQL)
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='archive_void_evidence_v2'").fetchone():
+            conn.create_function('archive_proof_current', 5, archive_void_evidence.proof_current)
+            statements[0] += " AND NOT EXISTS (SELECT 1 FROM main.archive_void_evidence_v2 v WHERE v.event_id=e.id AND archive_proof_current(v.path,v.size,v.mtime_ns,v.parent,v.fingerprint)=1)"
+        try:
+            import archive_verify
+        except ImportError:
+            archive_verify = None
+        if archive_verify and conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (archive_verify.TABLE,)).fetchone():
+            statements[0] += " AND " + archive_verify.view_filter("e")
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (compression_fixture_void.TABLE,)).fetchone():
+            statements[1] += " AND " + compression_fixture_void.view_filter("c")
+        for statement in statements:
             conn.execute(statement)
-        # SQLite resolves view columns lazily: a database missing a column the
-        # filters use (very old installs, minimal schemas) only fails on first
-        # read. Probe now and fall back to the raw tables instead.
+        # Probe lazy view resolution so older schemas can fall back safely.
         conn.execute("SELECT 1 FROM counted_savings_events LIMIT 0").fetchall()
         conn.execute("SELECT 1 FROM counted_compression_events LIMIT 0").fetchall()
         return True
@@ -631,7 +642,7 @@ def _counted_sql(table, template):
 def _connect_trends_db():
     """Open the trends DB with the standard pragmas (no migrations run)."""
     _measure_facade = _compat.facade()
-    conn = _measure_facade.sqlite3.connect(str(_measure_facade.TRENDS_DB))
+    conn = _measure_facade.sqlite3.connect(str(_measure_facade.TRENDS_DB), factory=upgrade_drain_control.SessionLogConnection)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
     # Auto-checkpoint every 100 pages (~400 KiB) instead of 1000 (~4 MiB).
@@ -881,11 +892,9 @@ def _init_trends_db():
     _measure_facade.ensure_activity_schema(conn)
     # Backfill session_uuid from jsonl_path basename stem for existing rows,
     # then create an index so joins are O(log n) instead of full-table LIKE scans.
-    # Done in Python (not a single SQL UPDATE) because SQLite lacks a basename
-    # function and the path separator can vary on Windows.
     try:
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_session_log_uuid ON session_log (session_uuid)"
+        conn.executescript(
+            "CREATE INDEX IF NOT EXISTS idx_session_log_uuid_date ON session_log (session_uuid, date DESC); CREATE INDEX IF NOT EXISTS idx_session_log_resume_activity ON session_log (COALESCE(NULLIF(last_activity_day,''),NULLIF(date,'')) DESC, COALESCE(collected_at,'') DESC, id DESC) WHERE session_uuid IS NOT NULL AND session_uuid != '';"
         )
         rows = conn.execute(
             "SELECT id, jsonl_path FROM session_log "
@@ -1344,7 +1353,7 @@ def _backfill_daily_usage(conn, days=None, budget_seconds=None):
     if not rows:
         return 0
     deadline = _measure_facade.time.monotonic() + budget_seconds
-    updates = []
+    updates = upgrade_drain_control.DailyUpdates(conn, _measure_facade)
     live_owners = _measure_facade._live_usage_owners(conn)
     for jsonl_path, stored_date in rows:
         if _measure_facade.time.monotonic() > deadline:
@@ -1377,26 +1386,9 @@ def _backfill_daily_usage(conn, days=None, budget_seconds=None):
                         _measure_facade.json.dumps(evidence["calls"]),
                         _measure_facade.json.dumps(evidence["metrics"]),
                         jsonl_path))
-    if not updates:
-        return 0
-
-    def batch_update():
-        _measure_facade = _compat.facade()
-        conn.executemany(
-            """UPDATE session_log
-               SET daily_usage_json = ?,
-                   session_uuid = COALESCE(session_uuid, ?),
-                   first_activity_day = ?, last_activity_day = ?, date = ?,
-                   parent_daily_usage_json = ?, daily_calls_json = ?,
-                   daily_metrics_json = ?
-               WHERE jsonl_path = ?""",
-            updates,
-        )
-        conn.commit()
-        return len(updates)
-
-    result = _measure_facade._retry_db_operation(conn, batch_update)
-    return result if result is not None else 0
+    if updates.pending and _measure_facade._retry_db_operation(conn, updates.flush) is None:
+        raise _measure_facade.sqlite3.OperationalError("database is locked")
+    return updates.count
 
 
 def _extract_session_uuid(session_id):
@@ -1469,7 +1461,6 @@ def _log_savings_event(event_type, tokens_saved, session_id=None, detail=None, m
     """
     _measure_facade = _compat.facade()
     try:
-        # Derive the stable join key before opening the DB connection.
         session_uuid, unjoinable = _measure_facade._extract_session_uuid(session_id)
 
         # Calculate cost saved using input token rate for the active model.
@@ -1507,9 +1498,9 @@ def _log_savings_event(event_type, tokens_saved, session_id=None, detail=None, m
             conn.execute(
                 "INSERT INTO savings_events "
                 "(timestamp, event_type, tokens_saved, cost_saved_usd, session_id, session_uuid, detail, model, unjoinable"
-                + o_col + ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?" + o_mark + ")",
+                + o_col + ") SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?" + o_mark + (" WHERE NOT EXISTS (SELECT 1 FROM savings_events WHERE event_type='resume_lean' AND (session_id=? OR session_uuid=?))" if event_type == "resume_lean" and session_id else ""),
                 (_measure_facade.datetime.now().isoformat(), event_type, tokens_saved, cost_saved,
-                 session_id, session_uuid, detail, normalized, 1 if unjoinable else 0) + o_val,
+                 session_id, session_uuid, detail, normalized, 1 if unjoinable else 0) + o_val + ((session_id, session_id) if event_type == "resume_lean" and session_id else ()),
             )
             conn.commit()
         finally:
@@ -1765,7 +1756,7 @@ def _get_compression_summary(days=None, since=None):
                 "SUM(CASE WHEN compressed_tokens > original_tokens "
                 "    THEN compressed_tokens - original_tokens ELSE 0 END) as gross_debit "
                 "FROM " + _measure_facade._counted_table(conn, "compression_events") + " WHERE timestamp >= ? "
-                "AND (tier IS NULL OR tier = 'measured') "
+                "AND feature != 'quality_nudge' AND (tier IS NULL OR tier = 'measured') "
                 "GROUP BY feature, model, session_uuid, session_id ORDER BY orig DESC",
                 (cutoff,),
             ).fetchall()
@@ -1794,7 +1785,7 @@ def _get_compression_summary(days=None, since=None):
             key = s_uuid if s_uuid in session_rates else ("session_id", sid)
             rate, priced_share = _measure_facade._compression_rate_coverage(model, key, session_rates, fallback_rate, tier_data)
             tokens_saved = orig - comp
-            cost_saved = round(tokens_saved * rate / 1_000_000, 6)
+            cost_saved = 0.0 if feature in ("mod_clean", "mod_clean_first") else round(tokens_saved * rate / 1_000_000, 6)
             # Gross credits and debits are kept apart (summed per event in SQL), so
             # an unknown-model expansion is disclosed rather than netted away.
             uncovered = max(0.0, 1.0 - priced_share)
@@ -1876,10 +1867,7 @@ def _get_compression_coverage(days=None):
     shadow opportunity can never be read as realized savings. These numbers do
     NOT feed _get_merged_savings (only _V5_COMPRESSION_CATEGORIES features do).
 
-    Also surfaces the first-read shadow quality proxy: edit_rate =
-    edits-after-shadow-read / shadow-reads. It is the promotion gate: a low
-    rate means the model rarely needed the full file, so a skeleton would have
-    been safe. Fail-open: returns an empty (but well-formed) structure on error.
+    Ordinary edits do not establish first-read safety.
     """
     _measure_facade = _compat.facade()
     out = {
@@ -1909,23 +1897,13 @@ def _get_compression_coverage(days=None):
         out["error"] = str(exc)
         return out
 
-    # Proxy denominator is the shadow-tier skeletons only; the numerator is their
-    # edit follow-ups. Both must come from the same opportunity cohort.
-    skeleton_cnt = 0
-    followup_cnt = 0
-    for feature, tier, cnt, _orig, _comp, _avg, _vcnt in rows:
-        if feature == _measure_facade._FEATURE_FIRST_READ_SKELETON and tier == "opportunity":
-            skeleton_cnt += cnt or 0
-        elif feature == _measure_facade._FEATURE_FIRST_READ_EDIT_FOLLOWUP and tier == "opportunity":
-            followup_cnt += cnt or 0
-
     for feature, tier, cnt, orig, comp, avg_ratio, vcnt in rows:
         if feature in _measure_facade._NON_SAVINGS_COMPRESSION_FEATURES:
             continue
         cnt = cnt or 0
         orig = orig or 0
         comp = comp or 0
-        safe_tier = tier if tier in _measure_facade._COMPRESSION_TIERS else "estimated"
+        safe_tier = "estimated" if feature == "quality_nudge" else (tier if tier in _measure_facade._COMPRESSION_TIERS else "estimated")
         realized = safe_tier == "measured"
         out["tiers"][safe_tier].append({
             "feature": feature,
@@ -1937,17 +1915,6 @@ def _get_compression_coverage(days=None):
             "verified_pct": round(100 * (vcnt or 0) / max(cnt, 1), 1),
             "shadow": not realized,
         })
-        out["available"] = True
-
-    if skeleton_cnt > 0:
-        edit_rate = followup_cnt / skeleton_cnt
-        out["first_read_proxy"] = {
-            "shadow_reads": skeleton_cnt,
-            "edits_after_read": followup_cnt,
-            "edit_rate_pct": round(100 * edit_rate, 1),
-            "promotion_gate_pct": round(100 * _measure_facade._FIRST_READ_PROMOTION_EDIT_RATE, 1),
-            "promotion_ready": edit_rate < _measure_facade._FIRST_READ_PROMOTION_EDIT_RATE,
-        }
         out["available"] = True
 
     for bucket in out["tiers"].values():
@@ -2213,16 +2180,7 @@ def _tripwire_lock():
 
 
 def evaluate_cohort_tripwire(force=None):
-    """Recompute per-cohort live edit-rates and auto-demote breaches.
-
-    Cheap, mtime-gated: returns the cached sidecar verdict unless it is older
-    than _TRIPWIRE_CACHE_TTL_SECONDS (or `force`). On a fresh compute, any active
-    cohort whose live edit-rate exceeds _TRIPWIRE_EDIT_RATE (with at least
-    _TRIPWIRE_MIN_SAMPLES active reads) is added to the demoted set. Demotions
-    are STICKY (hysteresis): a cohort already demoted stays demoted regardless of
-    a later dip — only the CLI promote / next backfill clears it. Each NEW
-    demotion logs one `cohort_demoted` event. Fail-open: returns {} on error.
-    """
+    """Preserve sticky demotions while outcome-based evidence runs in shadow."""
     # T1: read_corrupt distinguishes a malformed sidecar (force recompute) from a
     # fresh valid one. A corrupt verdict must never satisfy the TTL fast path.
     _measure_facade = _compat.facade()
@@ -2234,7 +2192,7 @@ def evaluate_cohort_tripwire(force=None):
         try:
             age = _measure_facade.time.time() - float(sidecar.get("_cached_ts", 0))
             if sidecar and age < _measure_facade._TRIPWIRE_CACHE_TTL_SECONDS:
-                return sidecar
+                return {**sidecar, "edit_rates": {}}
         except (TypeError, ValueError):
             pass
 
@@ -2251,7 +2209,7 @@ def evaluate_cohort_tripwire(force=None):
             try:
                 age = _measure_facade.time.time() - float(sidecar.get("_cached_ts", 0))
                 if sidecar and age < _measure_facade._TRIPWIRE_CACHE_TTL_SECONDS:
-                    return sidecar
+                    return {**sidecar, "edit_rates": {}}
             except (TypeError, ValueError):
                 pass
 
@@ -2262,71 +2220,12 @@ def evaluate_cohort_tripwire(force=None):
         promoted_at = sidecar.get("promoted_at", {})
         if not isinstance(promoted_at, dict):
             promoted_at = {}
-        try:
-            conn = _measure_facade._init_trends_db()
-            try:
-                rates = _measure_facade._compute_cohort_edit_rates(conn, promoted_at=promoted_at)
-            finally:
-                conn.close()
-        except Exception:
-            return sidecar or {}
-
-        demoted = set(prev_demoted)  # hysteresis: never un-demote here
-        newly_demoted = []
-        for cohort, r in rates.items():
-            if cohort in demoted:
-                continue
-            # T9: interpolated cohorts use a tighter sample floor.
-            if (
-                r["skeletons"] >= _measure_facade._tripwire_min_samples(cohort)
-                and r["edit_rate"] > _measure_facade._TRIPWIRE_EDIT_RATE
-            ):
-                demoted.add(cohort)
-                newly_demoted.append((cohort, r))
-
-        # Drop demotions for cohorts no longer in the active set (e.g. removed
-        # from FIRST_READ_ACTIVE_COHORTS) so the sidecar cannot pin a stale one.
-        active_cohorts = _measure_facade._resolve_active_cohorts()
-        demoted = {c for c in demoted if c in active_cohorts}
+        # Edits are normal work, not evidence of harm. Keep old demotions
+        # until an explicit promotion; shadow outcomes do not change settings.
+        rates = {}
+        demoted = set(prev_demoted)
 
         _measure_facade._write_tripwire_sidecar(demoted, rates, promoted_at=promoted_at)
-
-    for cohort, r in newly_demoted:
-        try:
-            _measure_facade._log_compression_event(
-                feature=_measure_facade._FEATURE_COHORT_DEMOTED,
-                original_text="",
-                compressed_text="",
-                command_pattern=f"{cohort[0]}|{cohort[1]}",
-                tier="opportunity",
-                verified=False,
-                quality_preserved=False,
-                detail=(
-                    f"auto-demoted: live edit-rate {r['edit_rate']*100:.1f}% "
-                    f"(> {_measure_facade._TRIPWIRE_EDIT_RATE*100:.0f}% gate) over "
-                    f"{r['skeletons']} active reads"
-                ),
-            )
-        except Exception:
-            pass
-        # T8: push one rate-limited warn line to stderr naming the cohort, its
-        # live edit rate, and the exact re-promote command. Operators watching
-        # hook stderr learn about a silent quality demotion immediately instead
-        # of only on the next compression-stats render.
-        key = f"{cohort[0]}|{cohort[1]}"
-        if key not in _measure_facade._tripwire_warned_cohorts:
-            _measure_facade._tripwire_warned_cohorts.add(key)
-            try:
-                print(
-                    f"[Token Optimizer] cohort auto-demoted to measure-only: "
-                    f"{cohort[0]}:{cohort[1]} (live edit-rate "
-                    f"{r['edit_rate']*100:.1f}% > {_measure_facade._TRIPWIRE_EDIT_RATE*100:.0f}% "
-                    f"gate). Re-promote: measure.py cohorts promote "
-                    f"{cohort[0]}:{cohort[1]}",
-                    file=_measure_facade.sys.stderr,
-                )
-            except Exception:
-                pass
 
     # T3: build the verdict from the in-memory demoted set + freshly-computed
     # rates rather than re-reading the file. A concurrent writer (or our own
@@ -2341,14 +2240,7 @@ def evaluate_cohort_tripwire(force=None):
 
 
 def _cohort_tripwire_state():
-    """Read-only tripwire view for compression-stats + the dashboard.
-
-    Returns {"cohorts": [...], "demoted": [[lang,band],...]}. Each cohort row
-    carries its live edit-rate and a `demoted` flag. Does NOT recompute or
-    demote — it reads the sidecar verdict (kept fresh by the Edit-hook
-    evaluation) plus the current edit-rates for display. Fail-open: empty on
-    error.
-    """
+    """Read sticky demotions without presenting edits as a harm rate."""
     _measure_facade = _compat.facade()
     out = {"cohorts": [], "demoted": []}
     sidecar = _measure_facade._read_tripwire_sidecar()
@@ -2356,38 +2248,14 @@ def _cohort_tripwire_state():
         tuple(c) for c in sidecar.get("demoted", [])
         if isinstance(c, (list, tuple)) and len(c) == 2
     )
-    promoted_at = sidecar.get("promoted_at", {})
-    if not isinstance(promoted_at, dict):
-        promoted_at = {}
     out["demoted"] = [list(c) for c in sorted(demoted)]
-    try:
-        conn = _measure_facade._init_trends_db()
-        try:
-            rates = _measure_facade._compute_cohort_edit_rates(conn, promoted_at=promoted_at)
-        finally:
-            conn.close()
-    except Exception:
-        return out
-    for cohort, r in sorted(rates.items()):
-        out["cohorts"].append({
-            "language": cohort[0],
-            "band": cohort[1],
-            # T9: full_gate | interpolated, so the dashboard/CLI can flag the
-            # thinner-sample (higher-exposure) interpolated cohorts honestly.
-            "basis": r.get("basis", _measure_facade._cohort_basis(cohort)),
-            "skeletons": r["skeletons"],
-            "followups": r["followups"],
-            "edit_rate_pct": round(100 * r["edit_rate"], 1),
-            "demoted": cohort in demoted,
-        })
     return out
 
 
 def cohorts_promote(cohort_args):
     """CLI: clear a tripwire demotion for one or more `lang:band` cohorts.
 
-    The ONLY runtime path that re-promotes a demoted cohort (hysteresis). Returns
-    the count cleared. Unknown cohorts are ignored with a note.
+    The ONLY runtime path that re-promotes a demoted cohort (hysteresis).
     """
     _measure_facade = _compat.facade()
     sidecar = _measure_facade._read_tripwire_sidecar()
@@ -2414,19 +2282,10 @@ def cohorts_promote(cohort_args):
         if cohort in demoted:
             demoted.discard(cohort)
             cleared += 1
-            # T5: stamp the promotion time so pre-promote skeleton/follow-up
-            # history is fenced out of the live edit-rate and the cohort cannot
-            # immediately re-demote on the very edits that demoted it.
+            # A fresh promotion also authorizes target-outline replacement.
             promoted_at[f"{cohort[0]}|{cohort[1]}"] = now
+            promoted_at[f"target_skeleton_v1|{cohort[0]}|{cohort[1]}"] = now
     if cleared:
         rates = {}
-        try:
-            conn = _measure_facade._init_trends_db()
-            try:
-                rates = _measure_facade._compute_cohort_edit_rates(conn, promoted_at=promoted_at)
-            finally:
-                conn.close()
-        except Exception:
-            pass
         _measure_facade._write_tripwire_sidecar(demoted, rates, promoted_at=promoted_at)
     return cleared

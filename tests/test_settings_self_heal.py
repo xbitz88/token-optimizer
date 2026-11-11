@@ -181,7 +181,8 @@ def test_healthy_file_snapshots_into_highwater(measure):
 
     highwater = heal_dir / "highwater.json"
     assert highwater.is_file(), "highwater.json must be created on a healthy sighting"
-    assert _read(highwater) == original, "highwater must be a copy of the healthy file"
+    expected = {k: v for k, v in original.items() if k != "env"}  # env is never backed up
+    assert _read(highwater) == expected, "highwater must be a copy of the healthy file minus secrets"
 
 
 # --------------------------------------------------------------------------- #
@@ -210,7 +211,8 @@ def test_wipe_with_only_machine_residue_is_healed(measure):
     assert "model" in healed, "model must be restored"
     assert "mcpServers" in healed, "mcpServers must be restored"
     assert "extraKnownMarketplaces" in healed, "extraKnownMarketplaces must be restored"
-    assert "env" in healed, "env must be restored"
+    # env carries credentials by design: never backed up, so never restored.
+    assert "env" not in healed, "env must NOT be restored (Token Optimizer never stores secrets)"
     assert "enabledPlugins" in healed, "enabledPlugins must be restored"
     # The restored values match the high-water mark.
     assert healed["permissions"] == FULL_SETTINGS["permissions"]
@@ -491,10 +493,10 @@ def test_highwater_only_updates_on_richer_sighting(measure):
     than the current high-water mark. A sighting with fewer keys (even if
     healthy) does not replace it."""
     mod, settings, heal_dir = measure
-    # First sighting: full settings (11 keys).
+    # First sighting: full settings (10 backed-up keys).
     mod._maybe_self_heal_settings()
     first_highwater = _read(heal_dir / "highwater.json")
-    assert len(first_highwater) == len(FULL_SETTINGS)
+    assert len(first_highwater) == len(FULL_SETTINGS) - 1  # every key but env
 
     # Second sighting: fewer keys but still healthy (has user-authored keys).
     smaller = {"permissions": {"allow": []}, "model": "sonnet"}
@@ -609,8 +611,9 @@ def test_backup_failure_aborts_heal(measure, monkeypatch):
     mod._maybe_self_heal_settings()  # snapshot
     _write(settings, WIPE_RESIDUE)
 
-    # Make _backup_settings_file return None to simulate backup failure.
-    monkeypatch.setattr(mod, "_backup_settings_file", lambda dest_dir: None)
+    # Make the pre-restore backup fail.
+    import settings_backup
+    monkeypatch.setattr(settings_backup, "backup_scrubbed", lambda facade, dest_dir: None)
 
     mod._maybe_self_heal_settings()
 

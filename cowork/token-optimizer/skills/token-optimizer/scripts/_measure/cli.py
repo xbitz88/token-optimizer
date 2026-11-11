@@ -1,6 +1,6 @@
 """Definition-only implementations; mutable state belongs to measure."""
 from __future__ import annotations
-from . import _compat
+from . import _compat, coverage_report
 
 
 def main():
@@ -501,6 +501,14 @@ def main():
         _measure_facade.set_pretool_baseline(_measure_facade.args[1:])
     elif _measure_facade.args[0] == "compare":
         _measure_facade.compare_snapshots()
+    elif _measure_facade.args[0] == "coverage-replay":
+        # Re-run the Bash hook's gates over this user's own transcripts. Read-only:
+        # prints a gate table, stores nothing, never prints command or output text.
+        _measure_facade.sys.exit(coverage_report.replay_cli(_measure_facade.args[1:], _measure_facade.CLAUDE_DIR / "projects"))
+    elif _measure_facade.args[0] == "file-refetch":
+        # Did the agent fetch the same file range again after TO cut file content printed
+        # through the shell? Metric only, read-only over this user's own transcripts.
+        _measure_facade.sys.exit(coverage_report.refetch_cli(_measure_facade.args[1:], _measure_facade.CLAUDE_DIR / "projects"))
     elif _measure_facade.args[0] == "dashboard":
         _measure_facade._dispatch_dashboard(_measure_facade.args)
     elif _measure_facade.args[0] == "status-bar":
@@ -1088,7 +1096,6 @@ def main():
             _measure_facade._clear_hook_budget(_measure_facade._tok_hook_old_sig)
     elif _measure_facade.args[0] == "keepwarm-arm":
         # Called by the Stop hook (additive). Appends one arm record to the
-        # keep-warm sidecar so the keepwarm-tick loop can later decide whether to
         # ping. Dumb + fast: a SIGALRM budget plus the writer's own fail-open
         # backstop keep it well inside the hook hot path; any failure is silent so
         # the hook chain is never broken. NO eligibility/policy here.
@@ -1109,7 +1116,8 @@ def main():
             _measure_facade.sys.exit(0)
         finally:
             _measure_facade._clear_hook_budget(_measure_facade._tok_hook_old_sig)
-    elif _measure_facade.args[0] == "keepwarm-enable":
+    elif _measure_facade.args[0] in ("keepwarm-enable", "mod-action"):
+        if _measure_facade.args[0] == "mod-action": from . import mod_action_booking; _measure_facade.sys.exit(mod_action_booking.main(_measure_facade))
         # Explicit opt-in. Refuses on subscription billing with the honest
         # message (no per-write premium to recover). On API billing it records
         # consent='enabled'; the scheduler install is a SEPARATE step.
@@ -1924,14 +1932,10 @@ def main():
             _measure_facade.conn.close()
         print(_measure_facade.json.dumps(_measure_facade._counted_cumulative_summary(), indent=2))
     elif _measure_facade.args[0] == "cohorts":
-        # First-read cohort tripwire control:
-        #   cohorts                       -> show live edit-rate + demotions
-        #   cohorts promote <lang:band..> -> clear a demotion (re-promote)
-        #   cohorts evaluate [--force]    -> recompute the verdict now
         _measure_facade.sub = _measure_facade.args[1] if len(_measure_facade.args) > 1 else "status"
         if _measure_facade.sub == "promote":
             _measure_facade.cleared = _measure_facade.cohorts_promote(_measure_facade.args[2:])
-            print(f"  Re-promoted {_measure_facade.cleared} cohort(s)." if _measure_facade.cleared
+            print(f"  Re-promoted {_measure_facade.cleared} cohort(s); eligible first reads may use target outlines." if _measure_facade.cleared
                   else "  No matching demoted cohorts to promote.")
         elif _measure_facade.sub == "evaluate":
             _measure_facade.evaluate_cohort_tripwire(force="--force" in _measure_facade.args)

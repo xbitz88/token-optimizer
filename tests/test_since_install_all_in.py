@@ -1,8 +1,9 @@
 """Since-install all-in total, the window-weighted estimate rate, and the
 one-time drain window.
 
-The since-install figure must use the monthly headline's own four parts
-(logged + routing + repeat reads + estimates), the update's one-time drain must
+The since-install figure must use the monthly headline's own parts
+(logged + repeat reads + estimates, with routing disclosed separately), the
+update's one-time drain must
 re-read all history so older months can be priced, and estimates must be priced
 at the window's model mix rather than the latest session's model.
 
@@ -106,9 +107,10 @@ def test_since_install_all_in_uses_the_headline_parts(m, monkeypatch):
     assert calls == {"merged": days, "counted": days}
     all_in = out["all_in"]
     parts = all_in["components_usd"]
-    assert parts["logged"] == 12.5 and parts["routing_estimated"] == 300.25 and parts["reread"] == pytest.approx(80.13, abs=0.011)
-    assert all_in["estimated_usd"] == pytest.approx(4.01)
-    assert all_in["total_usd"] == pytest.approx(round(12.5 + 300.25 + 80.125 + 4.01, 2), abs=0.011)
+    assert parts["logged"] == 12.5 and parts["routing_estimated"] == 0.0 and parts["reread"] == pytest.approx(80.13, abs=0.011)
+    assert all_in["routing_usd"] == pytest.approx(300.25)
+    assert all_in["estimated_usd"] == pytest.approx(0.01)
+    assert all_in["total_usd"] == pytest.approx(12.5 + 80.125 + 0.01, abs=0.011)
     total_cents = round(all_in["total_usd"] * 100)
     assert total_cents == round(sum(parts.values()) * 100) + round(all_in["estimated_usd"] * 100)
     assert all_in["routing_pending"] is False
@@ -120,5 +122,93 @@ def test_since_install_marks_pending_routing(m, monkeypatch):
                                                     "pending_sessions": 657}}
     monkeypatch.setattr(m, "_get_merged_savings", lambda days=30, since=None: dict(full))
     monkeypatch.setattr(m, "_counted_cumulative_summary", lambda days=None, **k: {"available": False})
-    all_in = m._savings_since_install()["all_in"]
+    out = m._savings_since_install()
+    all_in = out["all_in"]
     assert all_in["routing_pending"] is True and all_in["routing_pending_sessions"] == 657
+    assert out['excluded_usd']['routing'] is None
+
+
+def test_since_install_includes_realized_attested_setup_once(m, monkeypatch):
+    _install(m, 120)
+    full = {'total_cost_usd': 10, 'structural_detail': {'estimated': {'cost_saved_usd': 12.5}}}
+    monkeypatch.setattr(m, '_get_merged_savings', lambda **kw: dict(full))
+    monkeypatch.setattr(m, '_counted_cumulative_summary', lambda **kw: {'available': True, 'reread_usd': 5})
+    out = m._savings_since_install()
+    assert out['all_in']['estimated_usd'] == 12.5
+    assert out['all_in']['total_usd'] == 27.5
+
+
+def test_since_install_excludes_verbosity_and_reports_its_amount(m, monkeypatch):
+    _install(m, 120)
+    full = {'total_cost_usd': 20, 'by_category': {'verbosity_steer_measured': {'cost_saved_usd': 7}},
+            'verbosity_steer': {'cost_saved_usd': 3}, 'resume_lean_estimated': {'cost_saved_usd': 4},
+            'model_routing': {'realized_cost_usd': 2, 'evidence': 'estimated'}}
+    monkeypatch.setattr(m, '_get_merged_savings', lambda **kw: dict(full))
+    monkeypatch.setattr(m, '_counted_cumulative_summary', lambda **kw: {'available': True, 'reread_usd': 5})
+    out = m._savings_since_install()
+    assert out['excluded_usd'] == {'routing': 2, 'lean_resumes': 4, 'verbosity': 10}
+    assert out['all_in']['components_usd']['logged'] == 13
+    assert out['all_in']['estimated_usd'] == 0
+
+
+@pytest.mark.parametrize('share', [0.6, 0.8, 0.95])
+def test_since_install_includes_stated_routing_only_as_estimate(m, monkeypatch, share):
+    _install(m, 120)
+    routing = {'realized_cost_usd': 300.25, 'evidence': 'estimated', 'baseline_source': 'pretool_baseline',
+               'baseline_opus_share': share, 'measured_baseline_opus_share': 0.8369,
+               'measured_baseline_realized_cost_usd': 0.0}
+    monkeypatch.setattr(m, '_get_merged_savings', lambda **kw: {'total_cost_usd': 12.5, 'model_routing': routing})
+    monkeypatch.setattr(m, '_counted_cumulative_summary', lambda **kw: {'available': True, 'reread_usd': 80})
+    out = m._savings_since_install()
+    assert out['measured_usd'] == 12.5
+    assert out['all_in']['components_usd']['routing_estimated'] == 300.25
+    assert out['all_in']['total_usd'] == 392.75
+    assert out['all_in']['routing_measured_baseline_realized_cost_usd'] == 0
+
+
+def _routing_user(m, monkeypatch, routing, runtime='claude'):
+    _install(m, 120)
+    monkeypatch.setattr(m, 'detect_runtime', lambda: runtime)
+    monkeypatch.setattr(m, '_get_merged_savings', lambda **kw: {'total_cost_usd': 12.5, 'model_routing': routing})
+    monkeypatch.setattr(m, '_counted_cumulative_summary', lambda **kw: {'available': True, 'reread_usd': 80})
+    return m._savings_since_install()
+
+
+@pytest.mark.parametrize('source', ['snapshot', 'history'])
+def test_measured_only_user_gets_routing_from_install_mix(m, monkeypatch, source):
+    out = _routing_user(m, monkeypatch, {'realized_cost_usd': 41.5, 'evidence': 'estimated',
+                                         'baseline_source': source, 'baseline_opus_share': 0.71})
+    assert out['all_in']['components_usd']['routing_estimated'] == 41.5
+    assert out['all_in']['routing_baseline_source'] == 'measured_at_install'
+    assert out['all_in']['routing_baseline_opus_share'] == 0.71
+    assert out['excluded_usd']['routing'] is None
+
+
+def test_stated_share_overrides_and_is_labelled_stated(m, monkeypatch):
+    out = _routing_user(m, monkeypatch, {'realized_cost_usd': 77.0, 'evidence': 'estimated',
+                                         'baseline_source': 'pretool_baseline', 'baseline_opus_share': 0.6})
+    assert out['all_in']['components_usd']['routing_estimated'] == 77.0
+    assert out['all_in']['routing_baseline_source'] == 'stated'
+
+
+def test_no_baseline_means_no_routing(m, monkeypatch):
+    out = _routing_user(m, monkeypatch, {'realized_cost_usd': 0.0, 'evidence': 'unavailable', 'baseline_source': None,
+                                         'baseline_opus_share': 0.0})
+    assert out['excluded_usd'].get('routing') is not None or out['all_in']['components_usd']['routing_estimated'] == 0
+    assert out['all_in']['components_usd']['routing_estimated'] == 0
+    assert out['all_in']['routing_baseline_source'] is None
+
+
+def test_non_anthropic_runtime_never_gets_routing(m, monkeypatch):
+    out = _routing_user(m, monkeypatch, {'realized_cost_usd': 55.0, 'evidence': 'estimated',
+                                         'baseline_source': 'history', 'baseline_opus_share': 0.9}, runtime='codex')
+    assert out['all_in']['components_usd']['routing_estimated'] == 0
+    assert out['all_in']['routing_baseline_source'] is None
+
+
+
+def test_sonnet_only_install_mix_has_no_routing(m, monkeypatch):
+    out = _routing_user(m, monkeypatch, {'realized_cost_usd': 0.0, 'evidence': 'estimated',
+                                         'baseline_source': 'history', 'baseline_opus_share': 0.0})
+    assert out['all_in']['components_usd']['routing_estimated'] == 0
+    assert out['all_in']['routing_baseline_source'] is None

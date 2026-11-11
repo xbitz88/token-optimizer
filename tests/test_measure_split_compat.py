@@ -165,7 +165,9 @@ def _moved_consumer(name, domain, tmp_path):
     body, _ = measure_split.extract_definition(measure_source(Path(sys.modules['measure'].__file__)), name, domain)
     path = tmp_path / (name + '_provider.py')
     path.write_text('from _measure import _compat\n' + body, encoding='utf-8')
-    spec = importlib.util.spec_from_file_location(name + '_provider', path)
+    # Real providers live inside the _measure package, so give the extracted body
+    # that parent: sibling imports (`from . import mod_fresh_booking`) must resolve.
+    spec = importlib.util.spec_from_file_location('_measure.' + name + '_provider', path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     from _measure import _compat
@@ -176,7 +178,12 @@ def _moved_consumer(name, domain, tmp_path):
 
 def test_moved_savings_consumer_uses_patched_connection(m, tmp_path, monkeypatch):
     consumer = _moved_consumer('_get_savings_summary', 'savings', tmp_path)
-    connection = SimpleNamespace(execute=Mock(return_value=SimpleNamespace(fetchall=lambda: [('fixture', 1, 123, 4.5)])), close=Mock())
+    class Cursor:
+        def __iter__(self):
+            return iter([])
+        def fetchall(self):
+            return [('fixture', 1, 123, 4.5)]
+    connection = SimpleNamespace(execute=Mock(return_value=Cursor()), close=Mock())
     factory = Mock(return_value=connection)
     monkeypatch.setattr(m, '_init_trends_db', factory)
     def table(conn, name):
@@ -186,7 +193,8 @@ def test_moved_savings_consumer_uses_patched_connection(m, tmp_path, monkeypatch
     monkeypatch.setattr(m, '_session_model_reprice', lambda *a, **kw: ({}, 0, 0))
     result = consumer()
     assert result['total_tokens'] == 123
-    assert factory.call_count == 1 and connection.execute.call_count == 1
+    # Both schema probes and the summary query use the same patched connection.
+    assert factory.call_count == 1 and connection.execute.call_count == 3
     connection.close.assert_called_once()
 
 

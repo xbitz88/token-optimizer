@@ -755,110 +755,129 @@ def _dominant_turn_model(turns):
     return max(counts, key=counts.get) if counts else None
 
 
-def _detect_explicit_ttl(turns, tier_data, profile, dominant_model=None, detail_out=None):
-    """explicit_ttl detector: a gap > the profile's EFFECTIVE TTL followed by a
-    re-WRITE of the prior cached prefix is cache-expiry waste.
+def _detect_explicit_ttl(turns, tier_data, profile, dominant_model=None, detail_out=None,
+                         *, boundary=None, cutoff_ts=None, events_out=None):
+    """explicit_ttl detector: a gap longer than the cache TTL followed by a
+    re-WRITE of the prior cached prefix is a cache rebuild.
 
-    The detection boundary is per-profile (`effective_ttl_seconds`):
-      - anthropic_api: 300s (the live 5-min default; the user CAN raise it).
-      - claude_code: 3600s. Claude Code REQUESTS a 1-hour cache (v2.1.129 fixed
-        the silent downgrade to 5 min), and empirically the prefix survives
-        sub-hour pauses, so only pauses LONGER than the hour count as waste.
+    The boundary is the caller's `boundary` (the TTL the user's own writes
+    show, see _get_cache_ttl_waste) or, failing that, the profile's
+    `effective_ttl_seconds` (anthropic_api 300s, claude_code 3600s).
+
+    Each rebuild is priced on the prefix it actually rebuilt:
+    min(resume write, prefix cached before the gap) tokens, at the resume
+    turn's own 1h/5m write split (no split: the write rate that matches the
+    boundary), minus the cache read it would have cost with the cache alive.
+    Tokens written for NEW content on the resume turn are not waste.
+
+    `cutoff_ts` (epoch seconds) drops rebuilds whose resume turn predates the
+    window, so a long-lived file whose mtime is recent does not leak older
+    rebuilds. `events_out`, when a list, receives one dict per rebuild so the
+    caller can dedupe copies of one transcript across directories.
 
     The "recoverable" value depends on the profile's `recoverable_kind`:
-      - recoverable_1h (anthropic_api): the honest 1h-cache_control counterfactual
-        — banks the avoidable repeat-write cost minus the 2x-vs-1.25x premium on
-        the first (unavoidable) write, floored at 0.
-      - avoidable_behavioral (claude_code): there is NO setting to extend the
-        cache; the only lever is behavioral (resume within the hour / batch
-        related work). The avoidable value is the full waste delta a within-hour
-        resume would have spared (read at 0.1x instead of re-writing). No
-        first-write premium is netted (Claude Code already writes at 1h rates).
+      - recoverable_1h (anthropic_api): the 1h-cache_control counterfactual,
+        the repeat 5m writes minus the 2x-vs-1.25x premium on the first write.
+      - avoidable_behavioral (claude_code): no setting extends the cache; a
+        resume inside the TTL would have spared the whole rebuild delta.
 
     Returns (wasted_tokens, wasted_cost_usd, recoverable_usd, had_waste).
     """
     _measure_facade = _compat.facade()
-    boundary = profile.get("effective_ttl_seconds")
+    if boundary is None:
+        boundary = profile.get("effective_ttl_seconds")
     # Default to the CONSERVATIVE kind: an unknown recoverable_kind must never
-    # inflate the recoverable claim (recoverable_1h is the most aggressive
-    # accounting). avoidable_behavioral books no 1h-cache_control counterfactual.
+    # inflate the recoverable claim (recoverable_1h is the most aggressive).
     recoverable_kind = profile.get("recoverable_kind", "avoidable_behavioral")
-    # Only the recoverable_1h branch needs the repeat-write annuity + first-write
-    # accumulators; for any other kind they are computed and discarded, so gate
-    # their accumulation on that kind.
     track_repeat_write = recoverable_kind == "recoverable_1h"
-    session_waste_tokens = 0
-    session_waste_cost = 0.0
-    session_repeat_write_cost = 0.0
-    first_write_tokens = 0
-    had = False
 
-    # Hoist the model->rate lookup out of the per-turn loop: the session is
-    # resolved to a single cache profile via its dominant model, so its rates are
-    # constant for the whole session. W5: the caller already resolved the
-    # dominant model (the same value used to pick this profile); reuse it instead
-    # of re-scanning every turn. Fall back to a local scan only if not supplied.
+    # The session resolves to one cache profile via its dominant model, so the
+    # rates are constant for the whole session (W5: reuse the caller's model).
     model = dominant_model if dominant_model is not None else _measure_facade._dominant_turn_model(turns)
     rates = _measure_facade._claude_rates_for_model(model, tier_data)
-    if rates is None:
+    # Price only a model with its own rate card: a nearby family's card would
+    # put a guessed number on an unknown generation.
+    if rates is None or _measure_facade._counted_exact_card(model, tier_data, prompt_tokens=0) is None:
         return 0, 0.0, 0.0, False
     write_5m = rates.get("cache_write", rates.get("input", 3.0))
     write_1h = rates.get("cache_write_1h", write_5m)
     read_rate = rates.get("cache_read", rates.get("input", 3.0) * 0.1)
-    # No per-turn TTL split in the log: price the re-write at the profile's actual
-    # write rate. Claude Code holds a 1h cache (avoidable_behavioral -> write_1h);
-    # raw API/SDK runs at the 5m default (recoverable_1h -> write_5m).
-    default_write = write_1h if recoverable_kind == "avoidable_behavioral" else write_5m
+    # No TTL split on the turn: a rebuild past a 1-hour boundary was a 1h write.
+    default_write = write_1h if (boundary or 0) >= 3600 else write_5m
 
+    events = []
+    first_write_tokens = 0
     prev = None
     for turn in turns:
         cc = int(turn.get("cache_creation", 0) or 0)
-        cc_1h = int(turn.get("cache_creation_1h", 0) or 0)
-        cc_5m = int(turn.get("cache_creation_5m", 0) or 0)
         if track_repeat_write and cc > 0 and first_write_tokens == 0:
             first_write_tokens = cc
         if prev is not None:
             gap = turn.get("gap_since_prev_seconds")
-            # Threshold basis is executor occupancy (#287); the dollars below
-            # stay on the billed aggregate `cc`.
+            # Threshold basis is executor occupancy (#287).
             prev_cached = _measure_facade._turn_prefix_cached(prev)
+            resume_write = _measure_facade._turn_resume_write(turn)
             if (
                 gap is not None
                 and boundary is not None
                 and gap > boundary
                 and prev_cached > 0
-                and _measure_facade._turn_resume_write(turn) >= _measure_facade._CACHE_REWRITE_PREFIX_FRACTION * prev_cached
+                and resume_write >= _measure_facade._CACHE_REWRITE_PREFIX_FRACTION * prev_cached
             ):
+                ts = None
+                raw_ts = turn.get("timestamp")
+                if raw_ts:
+                    try:
+                        ts = _measure_facade.datetime.fromisoformat(
+                            str(raw_ts).replace("Z", "+00:00")).timestamp()
+                    except (ValueError, TypeError):
+                        ts = None
+                if cutoff_ts is not None and (ts is None or ts < cutoff_ts):
+                    prev = turn
+                    continue
+                rebuilt = min(resume_write, prev_cached)
+                cc_1h = int(turn.get("cache_creation_1h", 0) or 0)
+                cc_5m = int(turn.get("cache_creation_5m", 0) or 0)
+                share_1h = None
                 if cc_1h or cc_5m:
-                    split_1h = min(cc_1h, cc)
-                    split_5m = max(0, cc - split_1h)
-                    paid = (split_1h * write_1h + split_5m * write_5m) / 1e6
+                    share_1h = cc_1h / float(cc_1h + cc_5m)
+                    write_rate = share_1h * write_1h + (1 - share_1h) * write_5m
                 else:
-                    paid = cc * default_write / 1e6
-                avoided_read = cc * read_rate / 1e6
-                session_waste_tokens += cc
-                session_waste_cost += max(0.0, paid - avoided_read)
-                if track_repeat_write:
-                    session_repeat_write_cost += cc * write_5m / 1e6
-                had = True
+                    write_rate = default_write
+                events.append({
+                    "request_id": turn.get("request_id"),
+                    "timestamp": raw_ts,
+                    "gap_seconds": gap,
+                    "prev_cached": prev_cached,
+                    "resume_write": resume_write,
+                    "tokens": rebuilt,
+                    "write_rate": write_rate,
+                    "share_1h": share_1h,
+                    "write_1h": write_1h,
+                    "write_5m": write_5m,
+                    "read_rate": read_rate,
+                    "cost_usd": max(0.0, rebuilt * (write_rate - read_rate) / 1e6),
+                    "repeat_write_usd": rebuilt * write_5m / 1e6 if track_repeat_write else 0.0,
+                })
                 if detail_out is not None and gap > detail_out.get("max_gap", 0):
                     detail_out["max_gap"] = gap  # W8: widest waste-triggering gap
         prev = turn
 
+    if events_out is not None:
+        first_premium = first_write_tokens * (write_1h - write_5m) / 1e6 if first_write_tokens > 0 else 0.0
+        for event in events:
+            event["first_premium_usd"] = first_premium
+        events_out.extend(events)
+    tokens = sum(e["tokens"] for e in events)
+    cost = sum(e["cost_usd"] for e in events)
     recoverable = 0.0
-    if had:
+    if events:
         if recoverable_kind == "recoverable_1h":
-            # 1h-cache_control counterfactual (anthropic_api only): repeat writes
-            # avoided, less the 2x-vs-1.25x premium on the first write.
-            first_premium = 0.0
-            if first_write_tokens > 0:
-                first_premium = first_write_tokens * (write_1h - write_5m) / 1e6
-            recoverable = max(0.0, session_repeat_write_cost - first_premium)
+            first_premium = first_write_tokens * (write_1h - write_5m) / 1e6 if first_write_tokens > 0 else 0.0
+            recoverable = max(0.0, sum(e["repeat_write_usd"] for e in events) - first_premium)
         else:
-            # avoidable_behavioral (claude_code): no TTL setting to buy back the
-            # waste; a within-the-hour resume would have spared the whole delta.
-            recoverable = session_waste_cost
-    return session_waste_tokens, session_waste_cost, recoverable, had
+            recoverable = cost
+    return tokens, cost, recoverable, bool(events)
 
 
 def _detect_automatic_collapse(turns, profile, dominant_model=None, detail_out=None):
@@ -1803,6 +1822,10 @@ def _compute_model_routing_savings(days=None, since=None):
         "standardized_baseline_cost_usd": 0.0, "standardized_actual_cost_usd": 0.0,
         "actual_cost_usd": 0.0, "generation_price_delta_usd": 0.0,
         "baseline_opus_share": 0.0, "current_opus_share": 0.0,
+        "measured_baseline_opus_share": None,
+        "measured_baseline_realized_cost_usd": None,
+        "measured_baseline_source": None,
+        "measured_baseline_first_date": None,
         "baseline_source": None, "evidence": "unavailable",
     }
     try:
@@ -1813,30 +1836,15 @@ def _compute_model_routing_savings(days=None, since=None):
         if not cur_shares or cur_total <= 0:
             return zero
 
-        # Baseline mix: explicit pre-TO baseline (user knows it) first, then
-        # snapshot capture, else earliest measured history.
-        baseline_shares = None
-        baseline_source = None
+        # Baseline mix: the user's stated pre-TO baseline first, then the mix
+        # captured at install, the frozen baseline, else earliest history.
+        baseline_shares, baseline_source, baseline_stated, early_mix = None, None, False, None
         explicit = _measure_facade._pretool_baseline_mix()
         if explicit:
-            baseline_shares = explicit
-            baseline_source = "pretool_baseline"
-        if not baseline_shares:
-            try:
-                snap_path = _measure_facade.SNAPSHOT_DIR / "snapshot_before.json"
-                if snap_path.exists():
-                    snap = _measure_facade.json.loads(snap_path.read_text(encoding="utf-8"))
-                    mm = ((snap.get("model_mix") or {}).get("shares") or {}) if (snap.get("model_mix") or {}).get("activity_basis") == 1 else {}
-                    if mm:
-                        baseline_shares = mm
-                        baseline_source = "snapshot"
-            except (_measure_facade.json.JSONDecodeError, OSError, ValueError):
-                pass
-        if not baseline_shares:
-            early = _measure_facade._earliest_model_mix()
-            if early:
-                baseline_shares = early["shares"]
-                baseline_source = "history"
+            baseline_shares, baseline_source, baseline_stated = explicit, "pretool_baseline", True
+        else:
+            from . import baseline_provenance
+            baseline_shares, baseline_source, baseline_stated, early_mix = baseline_provenance.routing_baseline(_measure_facade)
         if not baseline_shares:
             return zero
 
@@ -2022,6 +2030,59 @@ def _compute_model_routing_savings(days=None, since=None):
             priced_usage[m].get(k, 0) * _rates(m)[k] for m in kept_models for k in _measure_facade._ROUTING_CLASSES
         ) / 1_000_000
         realized_cost = max(0.0, standardized_baseline - standardized_actual) if base_priced and kept_models else 0.0
+
+        def _realized_for_baseline(shares):
+            base = _renormalized(shares or {})
+            if not base or not kept_models:
+                return 0.0
+            baseline_cost = sum(
+                kept_totals[k] * sum(s * _fixed_family_rates(f)[k] for f, s in base.items())
+                for k in _measure_facade._ROUTING_CLASSES
+            ) / 1_000_000
+            return max(0.0, baseline_cost - standardized_actual)
+
+        measured_baseline = {}
+        if baseline_source == "pretool_baseline":
+            # The pre-activity migration retains the previously frozen baseline
+            # as baseline_state.json.pre-activity-v1[.N] beside the live file;
+            # its model_shares are the earliest measured mix, the honest
+            # measured alternative to a hand-entered pre-TO baseline.
+            archived = None
+            try:
+                for _ap in sorted(_measure_facade.SNAPSHOT_DIR.glob("baseline_state.json.pre-activity-v1*")):
+                    try:
+                        _ad = _measure_facade.json.loads(_ap.read_text(encoding="utf-8"))
+                    except (_measure_facade.json.JSONDecodeError, OSError, ValueError):
+                        continue
+                    _ashares = _ad.get("model_shares") if isinstance(_ad, dict) else None
+                    if isinstance(_ashares, dict) and _ashares.get("opus"):
+                        archived = {"shares": _ashares,
+                                    "first_date": (_ad.get("window") or {}).get("start")}
+                        break
+            except OSError:
+                archived = None
+            if archived:
+                measured_baseline = {
+                    "opus_share": round(float(archived["shares"].get("opus") or 0.0), 4),
+                    "source": "baseline_state_pre_activity",
+                    "first_date": archived.get("first_date"),
+                    "realized_cost_usd": round(_realized_for_baseline(archived["shares"]), 4),
+                }
+            else:
+                if early_mix is None:
+                    try:
+                        early_mix = _measure_facade._earliest_model_mix(
+                            lookback_days=_measure_facade._BASELINE_EARLY_WINDOW_DAYS)
+                    except Exception:
+                        early_mix = None
+                early_shares = (early_mix or {}).get("shares") or {}
+                if early_shares:
+                    measured_baseline = {
+                        "opus_share": round(float(early_shares.get("opus", 0.0) or 0.0), 4),
+                        "source": "history",
+                        "first_date": (early_mix or {}).get("first_date"),
+                        "realized_cost_usd": round(_realized_for_baseline(early_shares), 4),
+                    }
         compared_tokens = sum(kept_totals.values())
         window_tokens = unpriced_tokens + free_tokens + pooled + unsplit_tokens
 
@@ -2077,7 +2138,11 @@ def _compute_model_routing_savings(days=None, since=None):
             **_coverage_fields(),
             "baseline_opus_share": round(baseline_shares.get("opus", 0.0), 4),
             "current_opus_share": round(opus_share, 4),
-            "baseline_source": baseline_source,
+            "measured_baseline_opus_share": measured_baseline.get("opus_share"),
+            "measured_baseline_realized_cost_usd": measured_baseline.get("realized_cost_usd"),
+            "measured_baseline_source": measured_baseline.get("source"),
+            "measured_baseline_first_date": measured_baseline.get("first_date"),
+            "baseline_source": baseline_source, "baseline_stated": baseline_stated,
             "routable_fraction": _measure_facade._ROUTABLE_OPUS_FRACTION,
             # Realized routing is a standardized comparison on a fixed price
             # schedule (newest card per family) in both arms, because the baseline

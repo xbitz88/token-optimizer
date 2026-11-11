@@ -14,13 +14,13 @@ section 1 are enforced by tests; a rule without a test is a wish.
 
 | # | Rule | Enforced by |
 |---|---|---|
-| R1 | **One headline, four parts.** The monthly total is logged actions + realized model routing + repeat reads avoided + other estimates. Nothing else is added. | `test_action_savings_components.py` |
+| R1 | **One action headline.** The monthly total is logged actions, write-class premium, repeat reads and eligible estimates. Routing is separate. | `test_action_savings_components.py` |
 | R2 | **Parts add up to the total, to the cent.** Round once (largest remainder), never each part on its own. | `test_savings_display_cents.py` |
 | R3 | **What-ifs stay outside.** "Could save" items, cache drops and the routing what-if are never in the headline. | `test_action_savings_components.py`, `test_opportunity_routing_split.py` |
-| R4 | **Since install uses the same recipe.** The all-time figure is the same four parts summed over the install window. It can never be a single slice. | `test_since_install_all_in.py` |
+| R4 | **Since install separates evidence.** Show measured and estimated action savings separately, with stated-baseline routing in its own estimated band. | `test_since_install_all_in.py` |
 | R5 | **Longer never means smaller.** For non-negative parts, a longer window is at least the shorter one, and since install is at least the last 30 days. | `test_savings_invariants.py` |
 | R6 | **Every request counted once.** Streamed and replayed requests fold to one by request id, across sessions. | `test_usage_counted_once.py` |
-| R7 | **Only real work counts.** Test-suite and benchmark sessions, screenshots priced as text, and twin rows from two installs are left out of every total. | `test_counted_views.py` |
+| R7 | **Only real work counts.** Synthetic fixtures, screenshots priced as text, and twin rows are excluded. Benchmark sessions with transcript-proven API usage count. | `test_counted_views.py`, `test_transcript_backfill.py` |
 | R8 | **A debit mirrors its credit.** If a credit is left out (screenshot archive), its reversal (re-expanding that screenshot) is left out too. | `test_counted_views.py` |
 | R9 | **Price by token class and exact model.** Fresh input, cache read, 5-minute cache write, 1-hour cache write and output each have their own rate, for the model generation that ran. | `test_counted_pricing_integrity.py` |
 | R10 | **Unknown is $0 and said out loud.** A model or class with no known price is never given a guessed price. Its tokens are listed as unpriced. | `test_counted_pricing_integrity.py` |
@@ -56,8 +56,9 @@ the CLI as `ALL IN` and on the dashboard as the hero number.
 ### 3.1 Logged actions (measured)
 
 Token changes Token Optimizer metered itself: compressed command output, archived tool
-results that stayed collapsed, structure maps, quality and
-verbosity nudges with an observed before/after, cross-turn dedup.
+results that stayed collapsed, structure maps, quality nudges, cross-turn dedup.
+Verbosity nudges are not here: their before/after has no control, so they sit in
+the estimated tier (section 3.4) at their net-of-control size.
 
 "Measured" means observed token changes and observed actions only. A mechanism whose
 trigger was seen but whose token value is inferred — the working set a checkpoint
@@ -115,8 +116,9 @@ Removed context that the next calls would otherwise have re-read from cache.
   magnitude was metered (`_COUNTED_SE_EVENT_TYPES`). Counterfactual classes are
   deliberately excluded so an inferred size never compounds into repeat-read
   dollars: `resume_lean`, `checkpoint_restore`, `mcp_cap` and `hint_followed`
-  (plus the output-side `verbosity_*` nudges, which are generated once and never
-  re-read). Their estimated-tier values still appear in section 3.4; they just do
+  (plus the output-side `verbosity_*` nudges: a shorter reply IS re-read on every
+  later call until compaction, and `verbosity_output_estimated` scores that carry
+  turn by turn, net of the control, in the estimated tier). Their estimated-tier values still appear in section 3.4; they just do
   not ride the counted annuity. Removing `checkpoint_restore` from the counted
   set is why `counted_cumulative` / `reread_usd` can visibly drop for installs
   that used restores — the credit moved tiers, it was not deleted.
@@ -128,14 +130,20 @@ Each key below is one line in the report. All are priced at the window's input-r
 
 | Key | What it estimates |
 |---|---|
-| `resume_lean_estimated` | Cold resumes avoided by a lean restore (priced like its logged event) |
-| `checkpoint_restore_estimated` | Working-set re-reads a checkpoint restore let the session skip. The restore is observed; the avoided re-read is inferred from the session's own read history and capped, never metered |
+| `resume_lean_estimated` | Unverified historical proxy, excluded from totals. |
+| `resume_lean_verified` | Receiver-verified reload and carry estimate, capped at the old session's compaction window and the receiver's next compaction. |
+| `checkpoint_restore_estimated` | Unverified restore estimate, excluded from totals. |
+| `structural_estimated` | Realized setup cleanup estimated from dated archives or owner-attested trims, priced at each eligible call's cache-read rate. |
+| `keepwarm_estimated` | Keep-warm, net and signed. The cache-rewrite cost avoided by verified warm resumes, minus the full cost of every warm-up ping (pings that never led to a return, and manual warm-ups booked from the Claude Code mod, included). A paused session is credited once however many warm-ups it received. Can be negative, and is then subtracted. |
+| `mod_fresh_estimated` | Start-fresh actions taken from the Claude Code mod. The dropped old context (less the handoff) is priced at the cache-read rate for a continuation estimated from your own earlier sessions (cohort median, capped at 10 turns, needs a cohort of 5). Counted as 0 when `handover_rerun` is already positive, so the two overlapping counterfactuals are never stacked. |
+| `expand_overhead` | Estimated expansion-command and reread overhead, subtracted from action savings. |
 | `uncaptured_runtime` | Compression inside sub-agent runs that is never logged as an event |
 | `behavioral_estimate` | One more loop span avoided per caught loop |
-| `mcp_cap_estimated` | Large MCP results capped (priced like its logged event) |
+| `mcp_cap_estimated` | Unsupported flat cap estimate, excluded from totals. |
 | `handover_rerun` | Re-work avoided by a continuity handover, from your own session cohorts |
 | `contamination_exit` | Sessions that heeded a fresh-session nudge, from your own cohorts |
 | `verbosity_steer` | Output shortened by a concise-output nudge, before an observed measurement exists |
+| `verbosity_output_estimated` | Nudged replies against matched replies in sessions TO ran in but never nudged (same position, reply count, running mean, context size), plus the later rereads of that difference until compaction. Signed; credits only a positive net, else $0 with the per-nudge figure and its 95% interval shown. Recomputed at most daily by a user-run or detached collect, never on the hook path. The booked `verbosity_steer_measured` rows are kept for reference and never credited |
 | `hint_followed` | Searches avoided by a followed context hint. The hint->read pair is observed; the avoided-search size is a fixed estimate (used once any hint fires) |
 | `retrieval_serve` | Cohort estimate for avoided searches, used only before any hint fires |
 
@@ -314,32 +322,12 @@ them:
 
 ## 9. Quality score (a figure, but not a savings figure)
 
-The 0–100 "quality" number in the CLI, dashboard and status line is a
-**resource-pressure indicator**, not an accuracy measure. Since score
-schema v2 (`_QUALITY_SCORE_VERSION`):
+The 0–100 "quality" number is a **resource-pressure indicator**, not an accuracy measure. In score schema v3, the base remains fill (5/7) plus absolute waste (2/7), multiplied by continuity: `0.45 + 0.55 × 0.90 ** n_eff`. Each compaction contributes a size factor, clamped to 0.25–1.0 using tokens removed divided by 150,000, multiplied by an evidence factor: 0.5 for a delivered restore and clean follow-up, 0.75 for either a delivered restore awaiting measurement or a clean follow-up without one, 1.0 when unknown, and 1.5 when recovery needs attention.
 
-- **ResourceHealth** weights only context fill (5/7) and absolute waste
-  tokens (2/7). Compaction count carries **zero** weight — it is descriptive
-  metadata (`breakdown.compactions.weighted == false`). The earlier
-  count-only penalty and the "~65/88/95% context lost" display were removed:
-  the paired-window audit (research/arxiv-2611.05306) found no support for
-  fixed per-count loss.
-- **Recovery evidence is shadow-only this release.** `recovery_status` is
-  neutral `observing` on every surface after compaction. `recovery_evidence`
-  retains provisional evaluations of observed post-boundary signals — restore
-  delivery, tool errors, re-reads, repeated calls, loop events — from
-  matched ≤20-call windows before/after each compaction
-  (`_assess_compaction_recovery`). Statuses: `observing`,
-  `no_concerning_signal_observed`, `needs_attention`, `unmeasurable`.
-  Missing telemetry is unknown, never healthy. Public recovery scores remain
-  unset until thresholds are calibrated on held-out labels. Repeated failed
-  calls require no observed Edit, Write or MultiEdit in between. Test-runner
-  errors followed by edits remain in the raw counts but do not trigger an
-  error-rate-increase flag. Codex and OpenCode lack matched recovery windows;
-  their evidence stays unmeasurable while the display says `observing`.
-- **Versions never mix.** `score_version` gates cache carry-over,
-  ResourceHealth dampening and nudge baselines; a v1 cache is never
-  compared against a v2 score (`_quality_scores_comparable`).
+This is a **prior**, not a fitted measure of information loss. Compaction can lose details and repeated summaries compound that risk, so the score uses a bounded, evidence-sensitive term. The earlier paired-window audit found no support for a fixed per-count penalty. Fit the retention rate and evidence factors on paired-window data before treating these values as calibrated.
+
+Recovery evidence remains provisional and its public panel remains observational. Score versions are never compared for nudge baselines; a v2 cache does not seed v3 comparisons.
+
 - **Size remedies share one gate.** `/compact`, `/clear` and "start fresh"
   recommendations — including the 300–400K context-size advisory (default
   350K, once per session, eligibility not instruction) — require ≥300K
