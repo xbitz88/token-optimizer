@@ -1,5 +1,6 @@
 """W5: setup savings measured as a step in the first-call series. Synthetic transcripts only."""
 import json
+import shutil
 import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
@@ -224,7 +225,7 @@ def test_observer_stops_at_the_first_call_and_keeps_time_and_model():
 def test_card_words_each_status_plainly(tmp_path):
     import os
     import subprocess
-    node = subprocess.run(['which', 'node'], capture_output=True, text=True).stdout.strip()
+    node = shutil.which('node') or ''
     if not node:
         pytest.skip('node not installed')
     js = (ROOT / 'skills/token-optimizer/assets/first_call_context.js').read_text(encoding='utf-8')
@@ -280,7 +281,7 @@ def test_a_step_larger_than_the_trim_is_capped_at_the_trim_size():
 def test_first_call_card_leads_with_the_latest_median_and_change_since_the_first_month(tmp_path):
     import os
     import subprocess
-    node = subprocess.run(['which', 'node'], capture_output=True, text=True).stdout.strip()
+    node = shutil.which('node') or ''
     if not node:
         pytest.skip('node not installed')
     js = (ROOT / 'skills/token-optimizer/assets/first_call_context.js').read_text(encoding='utf-8')
@@ -295,6 +296,11 @@ def test_first_call_card_leads_with_the_latest_median_and_change_since_the_first
     var fold = h.slice(h.indexOf('<details'));
     if (fold.indexOf('Skills listing') < 0 || fold.indexOf('Skills listing') > fold.indexOf('Agents')) throw new Error('components sorted by size in fold');
     if (hero.indexOf('Skills listing') >= 0) throw new Error('components belong in the fold');
+    // More context before the first message is worse: a rise never renders in the savings green.
+    if (hero.indexOf('st-mega__note st-mega__note--worse') < 0) throw new Error('a rise must use the worse colour');
+    var down = firstCallContextHtml({months: [months[1], {month: '2026-12', median: 60000, p25: 50000, p75: 70000, n: 9, components: {}}], trim_dates: []});
+    var dh = down.slice(0, down.indexOf('<svg'));
+    if (dh.indexOf('-22K since November') < 0 || dh.indexOf('--worse') >= 0) throw new Error('a drop keeps the good colour');
     """
     path = tmp_path / 'fc2.js'
     path.write_text(script, encoding='utf-8')
